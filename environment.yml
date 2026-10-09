@@ -1,0 +1,19 @@
+name: qwen3-vl
+channels:
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu121
+      - torch==2.5.1
+      - transformers==4.57.3
+      - accelerate==1.12.0
+      - safetensors>=0.4.3
+      - sentence-transformers==5.1.2
+      - faiss-cpu==1.13.2
+      - sherpa-onnx==1.13.8
+      - soundfile==0.14.0
+      - fastapi>=0.115,<1
+      - uvicorn[standard]>=0.30,<1
+      - httpx2>=2,<3

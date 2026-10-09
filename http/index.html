@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#f5f8fc">
+  <title>智能业务助手</title>
+  <link rel="stylesheet" href="/static/vendor/katex/katex.min.css">
+  <link rel="stylesheet" href="/static/styles.css?v=8">
+</head>
+<body>
+  <div id="login" class="login-layer hidden">
+    <form id="login-form" class="login-card">
+      <div class="brand-mark">AI</div>
+      <h1>智能业务助手</h1>
+      <p>请输入启动终端中显示的临时访问密码</p>
+      <label><span>访问密码</span><input id="password" type="password" autocomplete="current-password" required></label>
+      <button class="primary" type="submit">进入助手</button>
+      <p id="login-error" class="error" role="alert"></p>
+    </form>
+  </div>
+
+  <div id="app" class="app-shell hidden">
+    <header class="topbar">
+      <button id="history-open" class="icon-button mobile-only" aria-label="打开历史记录">☰</button>
+      <div class="brand"><span class="brand-mark small">AI</span><div><strong>智能业务助手</strong><span id="connection-label">正在连接</span></div></div>
+      <div class="top-actions">
+        <button id="new-chat" class="soft-button">＋ 新对话</button>
+        <button id="settings-open" class="icon-button" aria-label="设置">⚙</button>
+      </div>
+    </header>
+
+    <aside id="history-panel" class="sidebar history-panel">
+      <div class="panel-heading"><div><span class="eyebrow">CONVERSATIONS</span><h2>历史记录</h2></div><button class="icon-button close-panel">×</button></div>
+      <div id="session-list" class="session-list"></div>
+    </aside>
+
+    <main class="conversation">
+      <section id="welcome" class="welcome">
+        <span class="welcome-orb">✦</span>
+        <p class="eyebrow">QWEN · RAG · VOICE</p>
+        <h1>今天想了解什么？</h1>
+        <p id="voice-help">可以输入文字，也可点击麦克风开始录音，再次点击结束并发送，识别后自动提问。回答会优先检索当前尊享百万保险资料。</p>
+        <div class="mode-picker" role="group" aria-label="思考模式">
+          <button data-mode="auto" class="mode-option active"><strong>自动协同</strong><span>快路径澄清，慢路径分析</span></button>
+          <button data-mode="fast" class="mode-option"><strong>快思考</strong><span>手动调试 · 简明回答</span></button>
+          <button data-mode="slow" class="mode-option"><strong>慢思考</strong><span>手动调试 · 完整分析</span></button>
+        </div>
+        <button id="hero-mic" class="hero-mic" aria-label="开始录音"><span>♫</span><b>点击开始录音</b></button>
+      </section>
+
+      <section id="messages" class="messages" aria-live="polite"></section>
+      <div id="toast" class="toast hidden" role="status"></div>
+
+      <form id="composer" class="composer">
+        <div id="stage" class="stage hidden"><span class="pulse"></span><span id="stage-label">正在处理</span></div>
+        <div class="compose-row">
+          <textarea id="prompt" rows="1" maxlength="4000" placeholder="输入问题，Enter 发送，Shift+Enter 换行"></textarea>
+          <button id="mic" type="button" class="round-button mic" aria-label="开始录音">♫</button>
+          <button id="send" type="submit" class="round-button send" aria-label="发送">↑</button>
+          <button id="stop" type="button" class="round-button stop hidden" aria-label="停止">■</button>
+        </div>
+        <div class="compose-meta"><span id="mode-label">自动协同</span><span id="voice-status" role="status">点击录音，再次点击结束并发送</span></div>
+      </form>
+    </main>
+
+    <aside id="evidence-panel" class="sidebar evidence-panel">
+      <div class="panel-heading"><div><span class="eyebrow">EVIDENCE</span><h2>回答依据</h2></div><button class="icon-button close-panel" aria-label="关闭回答依据">×</button></div>
+      <div id="evidence-content" class="evidence-empty">完成一次问答后，这里会显示检索到的 PDF 页码、相似度和文本片段。</div>
+    </aside>
+  </div>
+
+  <div id="settings" class="modal-layer hidden">
+    <section class="settings-card">
+      <div class="panel-heading"><div><span class="eyebrow">PREFERENCES</span><h2>设置</h2></div><button id="settings-close" class="icon-button">×</button></div>
+      <label class="setting-row"><span><strong>默认思考模式</strong><small>推荐自动协同；手动模式不绕过澄清和证据门控</small></span><select id="default-mode"><option value="auto">自动协同</option><option value="fast">快思考（调试）</option><option value="slow">慢思考（调试）</option></select></label>
+      <label class="setting-row"><span><strong>自动播放回答</strong><small>流式生成并连续播放女声</small></span><input id="autoplay" type="checkbox" checked></label>
+      <div class="setting-row"><span><strong>语音输入方式</strong><small>点击开始录音，再次点击结束并发送；需 HTTPS 或 localhost</small></span><b>录完再发送</b></div>
+      <label class="setting-row column"><span><strong>语速</strong><small id="speed-label">1.0×</small></span><input id="speech-speed" type="range" min="0.8" max="1.4" step="0.1" value="1"></label>
+      <div class="setting-row"><span><strong>当前音色</strong><small>CosyVoice 离线合成</small></span><b>中文女声</b></div>
+      <button id="clear-chat" class="danger-button">清空当前对话</button>
+    </section>
+  </div>
+  <div id="backdrop" class="backdrop hidden"></div>
+  <script src="/static/vendor/marked/marked.umd.js"></script>
+  <script src="/static/vendor/dompurify/purify.min.js"></script>
+  <script src="/static/vendor/katex/katex.min.js"></script>
+  <script src="/static/vendor/katex/auto-render.min.js"></script>
+  <script src="/static/app.js?v=12" defer></script>
+</body>
+</html>
