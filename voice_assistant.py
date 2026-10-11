@@ -172,7 +172,7 @@ class VoiceResponse(Iterator[AudioChunk]):
         if self.speed is not None:
             synthesis_options["speed"] = self.speed
         for chunk in self.tts.synthesize_stream(
-            text, index=self._audio_chunk_count, cancel_event=self._stop, sanitize=False,
+            text, index=self._audio_chunk_count, cancel_event=self._stop, sanitize=True,
             **synthesis_options,
         ):
             with self._lock:

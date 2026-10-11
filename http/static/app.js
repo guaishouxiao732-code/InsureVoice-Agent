@@ -13,6 +13,7 @@ const state = {
   recordingChunks: [],
   audioContext: null,
   audioCursor: 0,
+  audioQueue: Promise.resolve(),
   audioSources: new Set(),
   playbackEpoch: 0,
   responseId: 0,
@@ -313,40 +314,48 @@ function stopAudio() {
   state.audioSources.forEach(source => { try { source.stop(); } catch (_) {} });
   state.audioSources.clear();
   state.audioCursor = 0;
+  state.audioQueue = Promise.resolve();
   state.pendingAudio = 0;
   syncStopControls();
 }
 
-async function playPcm(base64Pcm, sampleRate) {
+async function playPcm(base64Pcm, sampleRate, epoch = state.playbackEpoch) {
+  await ensureAudio();
+  if (epoch !== state.playbackEpoch) return;
+  const raw = atob(base64Pcm);
+  const count = Math.floor(raw.length / 2);
+  const buffer = state.audioContext.createBuffer(1, count, sampleRate);
+  const channel = buffer.getChannelData(0);
+  for (let index = 0; index < count; index++) {
+    let value = raw.charCodeAt(index * 2) | (raw.charCodeAt(index * 2 + 1) << 8);
+    if (value >= 32768) value -= 65536;
+    channel[index] = value / 32768;
+  }
+  const source = state.audioContext.createBufferSource();
+  source.buffer = buffer;
+  source.connect(state.audioContext.destination);
+  const startAt = Math.max(state.audioCursor, state.audioContext.currentTime + .06);
+  source.start(startAt);
+  state.audioCursor = startAt + buffer.duration;
+  state.audioSources.add(source);
+  syncStopControls();
+  source.onended = () => { state.audioSources.delete(source); syncStopControls(); };
+}
+
+function enqueuePcm(base64Pcm, sampleRate) {
   const epoch = state.playbackEpoch;
   state.pendingAudio++;
   syncStopControls();
-  try {
-    await ensureAudio();
-    if (epoch !== state.playbackEpoch) return;
-    const raw = atob(base64Pcm);
-    const count = Math.floor(raw.length / 2);
-    const buffer = state.audioContext.createBuffer(1, count, sampleRate);
-    const channel = buffer.getChannelData(0);
-    for (let index = 0; index < count; index++) {
-      let value = raw.charCodeAt(index * 2) | (raw.charCodeAt(index * 2 + 1) << 8);
-      if (value >= 32768) value -= 65536;
-      channel[index] = value / 32768;
+  state.audioQueue = state.audioQueue.then(() => {
+    if (epoch === state.playbackEpoch) return playPcm(base64Pcm, sampleRate, epoch);
+  }).catch(error => {
+    if (epoch === state.playbackEpoch) toast(error.message);
+  }).finally(() => {
+    if (epoch === state.playbackEpoch) {
+      state.pendingAudio = Math.max(0, state.pendingAudio - 1);
+      syncStopControls();
     }
-    const source = state.audioContext.createBufferSource();
-    source.buffer = buffer;
-    source.connect(state.audioContext.destination);
-    const earliest = state.audioContext.currentTime + .06;
-    state.audioCursor = Math.max(state.audioCursor, earliest);
-    source.start(state.audioCursor);
-    state.audioCursor += buffer.duration;
-    state.audioSources.add(source);
-    syncStopControls();
-    source.onended = () => { state.audioSources.delete(source); syncStopControls(); };
-  } finally {
-    if (epoch === state.playbackEpoch) state.pendingAudio--;
-    syncStopControls();
-  }
+  });
 }
 
 function handleMessage(message) {
@@ -419,7 +428,7 @@ function handleMessage(message) {
       stopAudio();
       break;
     case 'audio_chunk':
-      playPcm(message.pcm, message.sample_rate).catch(error => toast(error.message));
+      enqueuePcm(message.pcm, message.sample_rate);
       break;
     case 'audio_end':
       setGenerating(false);

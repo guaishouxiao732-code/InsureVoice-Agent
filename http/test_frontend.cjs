@@ -65,6 +65,19 @@ vm.runInContext(app.replace(/initialize\(\);\s*$/, ''), context);
   assert.equal(vm.runInContext('state.audioSources.size',context),0);
   assert.equal(vm.runInContext('state.generating',context),false);
   assert.equal(context.sent.at(-1).type,'interrupt');
+  context.playOrder = [];
+  context.playTimes = [];
+  vm.runInContext(`state.audioContext={state:'running',currentTime:0,destination:{},
+    createBuffer:(channels,count,sampleRate)=>{const data=new Float32Array(count);return {
+      duration:count/sampleRate,getChannelData:()=>data};},
+    createBufferSource:()=>{const source={buffer:null,connect(){},start(time){
+      playOrder.push(this.buffer.getChannelData(0)[0]);playTimes.push(time);},stop(){}};return source;}};
+    enqueuePcm('AQA=',16000);enqueuePcm('AgA=',16000);`,context);
+  await vm.runInContext('state.audioQueue',context);
+  assert.deepEqual(Array.from(context.playOrder),[1/32768,2/32768], 'PCM chunks must be scheduled in arrival order');
+  assert.ok(Math.abs(context.playTimes[1] - context.playTimes[0] - 1/16000) < 1e-9,
+    'PCM chunks must be scheduled contiguously at a constant playback rate');
+  vm.runInContext('stopAudio()',context);
   vm.runInContext(`renderEvidence({knowledge_mode:'rag',sources:[{source_name:'未选中资料'}],
     evidence_sources:[{source_name:'已选中资料',location:'第1页',text:'实际注入模型的片段'}]})`,context);
   assert.equal(nodes.get('#evidence-content').children.length,2);

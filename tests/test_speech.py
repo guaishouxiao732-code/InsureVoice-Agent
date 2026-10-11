@@ -195,6 +195,17 @@ class SpeechTests(unittest.TestCase):
         self.assertEqual(spoken, "通义千问 可以回答问题")
         self.assertNotIn("PDF", spoken)
 
+    def test_sanitizer_reads_amounts_percentages_and_edition_years_in_chinese(self):
+        spoken = sanitize_for_speech(
+            "尊享E生2026版：我30岁，年缴318元，赔付比例100%，免赔额1万元；保费3,318.50元。"
+        )
+        self.assertEqual(
+            spoken,
+            "尊享E生二零二六版：我三十岁，年缴三百一十八元，赔付比例百分之一百，"
+            "免赔额一万元；保费三千三百一十八点五零元",
+        )
+        self.assertNotRegex(spoken, r"\d")
+
     def test_segmenter_prefers_punctuation_and_discards_source_footer(self):
         segmenter = SpeechTextSegmenter(first_max_chars=10, max_chars=16)
         output = []

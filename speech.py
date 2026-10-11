@@ -163,6 +163,7 @@ def _integer_to_chinese(value: int) -> str:
 
 
 def _number_to_chinese(value: str, *, digitwise: bool = False) -> str:
+    value = value.replace(",", "")
     integer, dot, fraction = value.partition(".")
     if digitwise:
         whole = "".join(_CHINESE_DIGITS[int(digit)] for digit in integer)
@@ -176,21 +177,22 @@ def _number_to_chinese(value: str, *, digitwise: bool = False) -> str:
 
 def _normalize_spoken_numbers(text: str) -> str:
     """Convert Arabic numerals for speech only, leaving displayed answers intact."""
-    number_pattern = re.compile(r"(?<![\d.])\d+(?:\.\d+)?(?![\d.])")
+    number_pattern = re.compile(r"(?<![\d.])(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?![\d.])")
 
     def read_percent(match: re.Match[str]) -> str:
         return "百分之" + _number_to_chinese(match.group("number"))
 
     text = re.sub(
-        r"(?P<number>(?<![\d.])\d+(?:\.\d+)?)(?:\s*[%％])",
+        r"(?P<number>(?<![\d.])(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)(?:\s*[%％])",
         read_percent,
         text,
     )
 
     def read_number(match: re.Match[str]) -> str:
         value = match.group()
-        # Years are conventionally read digit by digit in Chinese speech.
-        is_year = len(value) == 4 and text[match.end():].lstrip().startswith("年")
+        # Years and edition numbers are conventionally read digit by digit.
+        suffix = text[match.end():].lstrip()
+        is_year = len(value.replace(",", "")) == 4 and suffix.startswith(("年", "版", "款"))
         return _number_to_chinese(value, digitwise=is_year)
 
     return number_pattern.sub(read_number, text)
