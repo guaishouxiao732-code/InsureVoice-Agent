@@ -105,7 +105,7 @@ set +a
 | `COSYVOICE_CODE_PATH` | 上游源码：`third_party/CosyVoice` |
 | `COSYVOICE_PYTHON` | 独立 TTS 环境的 Python；空值时自动寻找同一 Conda 安装中的 `cosyvoice` 环境 |
 | `RAG_EMBEDDING_MODEL` | BGE 权重：`models/bge-small-zh-v1.5` |
-| `KNOWLEDGE_SOURCE` | 自备知识目录：`knowledge` |
+| `KNOWLEDGE_SOURCE` | 本机知识目录：`/home/scai/桌面/fyx/knowledge`；迁移机器后可覆盖 |
 | `RAG_INDEX_DIR` | 索引：`data/rag/insurance` |
 | `RAG_RATE_TRANSCRIPTION` | 可选人工核对费率转录路径 |
 | `CONTEXT_DB_PATH` / `WEB_DB_PATH` | 命令行 / 网页数据库；默认为 `data/` 下不同文件 |
@@ -161,10 +161,10 @@ git -C third_party/CosyVoice submodule update --init --recursive
 
 ```bash
 conda activate qwen3-vl
-python build_rag_index.py --source /absolute/path/to/your/knowledge
+python build_rag_index.py
 ```
 
-必须把示例路径替换为真实绝对路径。也可以设置 `KNOWLEDGE_SOURCE` 后执行 `python build_rag_index.py`，或将资料放进默认的 `knowledge/`。默认输出为 `data/rag/insurance`。读取索引时会校验源文件和哈希，因此知识原文件也必须保留在该机器上；迁移机器后应重新构建索引。改动原有知识目录默认值不会重写现有索引中的来源路径。
+本机默认从 `/home/scai/桌面/fyx/knowledge` 读取资料；迁移机器后通过 `KNOWLEDGE_SOURCE` 或 `--source` 指定新目录。默认输出为 `data/rag/insurance`。读取索引时会校验源文件和哈希，因此知识原文件也必须保留在该机器上；迁移机器后应重新构建索引。更改知识库目录后必须重新构建索引，否则现有索引仍指向旧路径。
 
 图片型 PDF 的数字表格不能仅靠文本提取保证识别。若复现保险费率场景，请自行准备经授权、人工核对的 `data/rag/insurance_fee_rates.md`，与原始费率 PDF 一起核对并重建索引。仓库不附带这份业务资产，也不保证换一套资料后仍能得到原示例报价。
 

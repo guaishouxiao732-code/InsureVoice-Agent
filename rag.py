@@ -32,7 +32,7 @@ from api import Qwen3Client
 from project_config import PROJECT_ROOT, project_path
 
 
-DEFAULT_SOURCE_PATH = project_path("KNOWLEDGE_SOURCE", "knowledge")
+DEFAULT_SOURCE_PATH = project_path("KNOWLEDGE_SOURCE", "/home/scai/桌面/fyx/knowledge")
 DEFAULT_EMBEDDING_PATH = project_path("RAG_EMBEDDING_MODEL", "models/bge-small-zh-v1.5")
 DEFAULT_INDEX_DIR = project_path("RAG_INDEX_DIR", "data/rag/insurance")
 DEFAULT_RATE_TRANSCRIPTION_PATH = project_path("RAG_RATE_TRANSCRIPTION", "data/rag/insurance_fee_rates.md")
@@ -46,7 +46,14 @@ HANDOFF_MESSAGE = (
 _WATERMARK_CHARS = set("同济数学内部传阅，, ")
 _FOLLOW_UP_MARKERS = (
     "它", "这个", "该", "上述", "前者", "后者", "其", "刚才", "上一个",
-    "逆命题", "证明呢", "为什么", "怎么算", "继续",
+    "逆命题", "证明呢", "为什么呢", "怎么算", "继续", "还有", "另外",
+    "展开", "详细", "具体", "解释一下", "说明一下", "举个例子", "举例说明",
+    "再说说", "再讲讲", "再详细", "补充",
+)
+_LOW_INFORMATION_REPLY = re.compile(
+    r"^(?:嗯+|好+|可以|不可以|是|不是|对|不对|有|没有|不知道|不清楚|"
+    r"年缴|月缴|趸缴|理赔|投保|核保|健康告知|个人|家庭|是的|不是的|"
+    r"有社保|无社保|有医保|无医保|城镇职工|城乡居民)[。！!？?，, ]*$"
 )
 
 
@@ -821,9 +828,41 @@ class RAGClient:
         question = user_texts[-1]
         # Short questions are not automatically follow-ups: for example,
         # "Python列表和元组有什么区别？" is brief but starts a new topic.
-        # Only explicit anaphora/continuation markers inherit the previous turn.
-        needs_context = any(marker in question for marker in _FOLLOW_UP_MARKERS)
-        query = f"{user_texts[-2]}\n追问：{question}" if needs_context and len(user_texts) > 1 else question
+        # Only explicit anaphora/continuation markers inherit prior user context.
+        trimmed_question = question.lstrip()
+        needs_context = (
+            any(marker in question for marker in _FOLLOW_UP_MARKERS)
+            or trimmed_question.startswith(("那", "接着", "然后"))
+            or question.rstrip("。！？!? ").endswith("呢")
+        )
+        query = question
+        if needs_context and len(user_texts) > 1:
+            prior_turns = user_texts[:-1]
+
+            def is_fragment(text: str) -> bool:
+                normalized = re.sub(r"[\s，。！？、,.!?；;：:]", "", text)
+                return len(normalized) <= 5 or bool(_LOW_INFORMATION_REPLY.fullmatch(text))
+
+            # A short user reply may be a slot/clarification ("有社保", "年缴").
+            # In that case retrieve using the earlier substantive user topic too.
+            anchor_index = len(prior_turns) - 1
+            if is_fragment(prior_turns[-1]):
+                for index in range(len(prior_turns) - 2, max(-1, len(prior_turns) - 5), -1):
+                    if not is_fragment(prior_turns[index]):
+                        anchor_index = index
+                        break
+
+            context_turns = prior_turns[anchor_index:]
+            # Keep at most three recent user turns and bound each one so a long
+            # conversation cannot turn the retrieval query into a transcript.
+            context_turns = context_turns[-3:]
+            if len(context_turns) == 1:
+                context = context_turns[0][:300]
+            else:
+                context = "\n".join(
+                    f"用户前文：{turn[:300]}" for turn in context_turns
+                )
+            query = f"{context}\n追问：{question}"
         return question, query
 
     def _prepare(

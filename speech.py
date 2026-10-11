@@ -112,6 +112,90 @@ def _apply_corrections(text: str, corrections: Mapping[str, str] | None) -> str:
     return text
 
 
+_CHINESE_DIGITS = "零一二三四五六七八九"
+_CHINESE_SMALL_UNITS = ("", "十", "百", "千")
+_CHINESE_GROUP_UNITS = ("", "万", "亿", "兆")
+
+
+def _integer_to_chinese(value: int) -> str:
+    """Read an Arabic integer as a Chinese cardinal number."""
+    if value == 0:
+        return "零"
+    if value < 0 or value >= 10**16:
+        return "".join(_CHINESE_DIGITS[int(digit)] for digit in str(value))
+
+    def read_group(group: int) -> str:
+        output: list[str] = []
+        zero_pending = False
+        for position in range(3, -1, -1):
+            unit_value = 10**position
+            digit = group // unit_value % 10
+            if digit == 0:
+                if output and group % unit_value:
+                    zero_pending = True
+                continue
+            if zero_pending:
+                output.append("零")
+                zero_pending = False
+            if not (digit == 1 and position == 1 and not output):
+                output.append(_CHINESE_DIGITS[digit])
+            output.append(_CHINESE_SMALL_UNITS[position])
+        return "".join(output)
+
+    groups: list[int] = []
+    while value:
+        groups.append(value % 10_000)
+        value //= 10_000
+
+    output: list[str] = []
+    zero_pending = False
+    for position in range(len(groups) - 1, -1, -1):
+        group = groups[position]
+        if group == 0:
+            if output:
+                zero_pending = True
+            continue
+        if output and (zero_pending or group < 1_000):
+            output.append("零")
+        output.append(read_group(group) + _CHINESE_GROUP_UNITS[position])
+        zero_pending = False
+    return "".join(output)
+
+
+def _number_to_chinese(value: str, *, digitwise: bool = False) -> str:
+    integer, dot, fraction = value.partition(".")
+    if digitwise:
+        whole = "".join(_CHINESE_DIGITS[int(digit)] for digit in integer)
+    else:
+        whole = _integer_to_chinese(int(integer))
+    if not dot:
+        return whole
+    decimals = "".join(_CHINESE_DIGITS[int(digit)] for digit in fraction)
+    return f"{whole}点{decimals}" if decimals else whole
+
+
+def _normalize_spoken_numbers(text: str) -> str:
+    """Convert Arabic numerals for speech only, leaving displayed answers intact."""
+    number_pattern = re.compile(r"(?<![\d.])\d+(?:\.\d+)?(?![\d.])")
+
+    def read_percent(match: re.Match[str]) -> str:
+        return "百分之" + _number_to_chinese(match.group("number"))
+
+    text = re.sub(
+        r"(?P<number>(?<![\d.])\d+(?:\.\d+)?)(?:\s*[%％])",
+        read_percent,
+        text,
+    )
+
+    def read_number(match: re.Match[str]) -> str:
+        value = match.group()
+        # Years are conventionally read digit by digit in Chinese speech.
+        is_year = len(value) == 4 and text[match.end():].lstrip().startswith("年")
+        return _number_to_chinese(value, digitwise=is_year)
+
+    return number_pattern.sub(read_number, text)
+
+
 def sanitize_for_speech(
     text: str, *, pronunciations: Mapping[str, str] | None = None,
 ) -> str:
@@ -143,6 +227,7 @@ def sanitize_for_speech(
     if pronunciations:
         mapping.update(pronunciations)
     text = _apply_corrections(text, mapping)
+    text = _normalize_spoken_numbers(text)
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\s*\n+\s*", "。", text)
     text = re.sub(r"。{2,}", "。", text)
