@@ -206,26 +206,34 @@ def _normalize_pcm16_loudness(
     target_rms: float = 3277.0,
     max_gain: float = 2.0,
 ) -> tuple[bytes, float]:
-    """Gently level a streamed PCM chunk, with a short gain ramp at its start."""
+    """Level short speech windows so a quiet trailing syllable stays audible."""
     samples = np.frombuffer(pcm16, dtype="<i2").astype(np.float32)
     if not samples.size or sample_rate <= 0:
         return pcm16, previous_gain
 
-    active = np.abs(samples) >= 328.0  # Ignore near-silence when estimating level.
-    if not np.any(active):
-        return pcm16, previous_gain
+    # Per-chunk RMS misses a quiet last syllable inside an otherwise loud
+    # chunk. Estimate over 100 ms speech windows and interpolate the gain
+    # smoothly; windows containing only silence/noise keep the previous gain.
+    window_size = max(1, int(sample_rate * 0.1))
+    centers: list[float] = [0.0]
+    gains: list[float] = [float(previous_gain)]
+    last_gain = float(previous_gain)
+    for start in range(0, samples.size, window_size):
+        end = min(samples.size, start + window_size)
+        window = samples[start:end]
+        active = np.abs(window) >= 328.0
+        if int(np.count_nonzero(active)) >= max(1, int(window.size * 0.05)):
+            measured_rms = float(np.sqrt(np.mean(np.square(window[active]))))
+            last_gain = float(np.clip(target_rms / max(measured_rms, 1.0), 0.5, max_gain))
+        centers.append((start + end) / 2)
+        gains.append(last_gain)
 
-    measured_rms = float(np.sqrt(np.mean(np.square(samples[active]))))
-    gain = float(np.clip(target_rms / max(measured_rms, 1.0), 0.5, max_gain))
-    peak = float(np.max(np.abs(samples)))
+    positions = np.arange(samples.size, dtype=np.float32)
+    envelope = np.interp(positions, centers, gains).astype(np.float32)
+    peak = float(np.max(np.abs(samples * envelope)))
     if peak:
-        gain = min(gain, 0.95 * 32767.0 / peak)
-
-    ramp_samples = min(samples.size, max(1, int(sample_rate * 0.02)))
-    envelope = np.full(samples.size, gain, dtype=np.float32)
-    envelope[:ramp_samples] = np.linspace(
-        previous_gain, gain, ramp_samples, endpoint=True, dtype=np.float32,
-    )
+        envelope *= min(1.0, 0.95 * 32767.0 / peak)
+    gain = last_gain
     leveled = np.clip(np.rint(samples * envelope), -32768, 32767).astype("<i2")
     return leveled.tobytes(), gain
 
@@ -500,6 +508,7 @@ class TTSClient:
         auto_start: bool = True,
         startup_timeout: float = 120.0,
         request_timeout: float = 120.0,
+        seed: int = 1986,
         pronunciations: Mapping[str, str] | None = None,
     ) -> None:
         self.model_path = Path(model_path).expanduser().resolve()
@@ -528,6 +537,7 @@ class TTSClient:
         self.auto_start = auto_start
         self.startup_timeout = float(startup_timeout)
         self.request_timeout = float(request_timeout)
+        self.seed = int(seed)
         self.pronunciations = dict(pronunciations or {})
         self._lock = Lock()
         self._last_normalizer_gain = 1.0
@@ -630,6 +640,7 @@ class TTSClient:
             f"{self.server_url}/synthesize",
             data=json.dumps({
                 "text": spoken, "speaker": selected_speaker, "speed": selected_speed,
+                "seed": self.seed,
             }, ensure_ascii=False).encode("utf-8"),
             headers={"Content-Type": "application/json"}, method="POST",
         )

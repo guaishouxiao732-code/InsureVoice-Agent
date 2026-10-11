@@ -237,6 +237,17 @@ class SpeechTests(unittest.TestCase):
             self.assertLessEqual(float(np.max(np.abs(samples))), 32767)
         self.assertLess(abs(measured_levels[0] - measured_levels[1]), 400)
 
+    def test_pcm_loudness_levels_quiet_speech_at_end_of_same_chunk(self):
+        sample_rate = 16_000
+        timeline = np.arange(sample_rate, dtype=np.float32) / sample_rate
+        amplitudes = np.where(timeline < 0.6, 8_000.0, 3_000.0)
+        pcm = np.rint(amplitudes * np.sin(2 * np.pi * 220 * timeline)).astype("<i2").tobytes()
+        normalized, _ = _normalize_pcm16_loudness(pcm, sample_rate)
+        samples = np.frombuffer(normalized, dtype="<i2").astype(np.float32)
+        first_rms = float(np.sqrt(np.mean(samples[int(0.2 * sample_rate):int(0.55 * sample_rate)] ** 2)))
+        final_rms = float(np.sqrt(np.mean(samples[int(0.7 * sample_rate):int(0.95 * sample_rate)] ** 2)))
+        self.assertLess(abs(first_rms - final_rms), 250)
+
     def test_all_tts_segments_keep_the_same_speed(self):
         tts = FakeTTS()
         asr = ASRResult("测试", "zh", "", "", 0, 0, 0, 0, ())

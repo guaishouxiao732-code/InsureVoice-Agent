@@ -30,6 +30,7 @@ os.environ.setdefault("MODELSCOPE_OFFLINE", "1")
 
 import torch  # noqa: E402
 from cosyvoice.cli.cosyvoice import AutoModel  # noqa: E402
+from cosyvoice.utils.common import set_all_random_seed  # noqa: E402
 
 
 DEFAULT_MODEL_PATH = project_path("TTS_MODEL_PATH", "models/speech/CosyVoice-300M-SFT")
@@ -96,6 +97,7 @@ class CosyVoiceHandler(BaseHTTPRequestHandler):
             text = payload.get("text", "")
             speaker = payload.get("speaker", "中文女")
             speed = float(payload.get("speed", 1.0))
+            seed = int(payload.get("seed", 1986))
             if not isinstance(text, str) or not text.strip():
                 raise ValueError("text must not be empty")
             if speaker not in self.server.speakers:
@@ -115,6 +117,9 @@ class CosyVoiceHandler(BaseHTTPRequestHandler):
         previous = started
         try:
             with self.server.model_lock, torch.inference_mode():
+                # Reset CosyVoice's stochastic sampling for stable voice
+                # character across separate streaming requests.
+                set_all_random_seed(seed)
                 for index, item in enumerate(self.server.model.inference_sft(
                     text.strip(), speaker, stream=True, speed=speed,
                 )):
