@@ -10,7 +10,15 @@ from threading import Event
 from time import perf_counter
 import unittest
 
-from speech import ASRResult, AudioChunk, SpeechTextSegmenter, sanitize_for_speech
+import numpy as np
+
+from speech import (
+    ASRResult,
+    AudioChunk,
+    SpeechTextSegmenter,
+    _normalize_pcm16_loudness,
+    sanitize_for_speech,
+)
 from voice_assistant import VoiceResponse, VoiceAssistant
 from context_manager import ContextManager
 from rag import HANDOFF_MESSAGE, RAGClient, RetrievalResult
@@ -64,12 +72,15 @@ class FakeTextResponse:
 
 class FakeTTS:
     pronunciations = {}
+    speed = 1.0
 
     def __init__(self):
         self.spoken = []
+        self.speeds = []
 
-    def synthesize_stream(self, text, *, index, cancel_event, sanitize):
+    def synthesize_stream(self, text, *, index, cancel_event, sanitize, speed):
         self.spoken.append(text)
+        self.speeds.append(speed)
         yield AudioChunk(
             index=index,
             text=text,
@@ -205,6 +216,37 @@ class SpeechTests(unittest.TestCase):
             "免赔额一万元；保费三千三百一十八点五零元",
         )
         self.assertNotRegex(spoken, r"\d")
+
+    def test_sanitizer_reads_division_and_omits_parentheses(self):
+        spoken = sanitize_for_speech("计算12÷3，括号内（12+6）乘以2。")
+        self.assertEqual(spoken, "计算十二除以三，括号内十二加六乘以二")
+        self.assertNotRegex(spoken, r"[()（）÷+×]")
+
+    def test_pcm_loudness_is_leveled_without_clipping(self):
+        timeline = np.arange(16_000, dtype=np.float32) / 16_000
+        previous_gain = 1.0
+        measured_levels = []
+        for amplitude in (8_000, 5_000):
+            pcm = np.rint(amplitude * np.sin(2 * np.pi * 220 * timeline)).astype("<i2").tobytes()
+            normalized, previous_gain = _normalize_pcm16_loudness(
+                pcm, 16_000, previous_gain=previous_gain,
+            )
+            samples = np.frombuffer(normalized, dtype="<i2").astype(np.float32)
+            active = samples[np.abs(samples) >= 328]
+            measured_levels.append(float(np.sqrt(np.mean(active**2))))
+            self.assertLessEqual(float(np.max(np.abs(samples))), 32767)
+        self.assertLess(abs(measured_levels[0] - measured_levels[1]), 400)
+
+    def test_all_tts_segments_keep_the_same_speed(self):
+        tts = FakeTTS()
+        asr = ASRResult("测试", "zh", "", "", 0, 0, 0, 0, ())
+        response = FakeTextResponse(["第一句话。", "第二句话。", "第三句话。"])
+        voice = VoiceResponse(
+            response, tts, asr, request_started=perf_counter(), prebuffer_ms=0, speed=0.9,
+        )
+        list(voice)
+        self.assertEqual(tts.speeds, [0.9, 0.9])
+        self.assertEqual(tts.spoken, ["第一句话", "第二句话。第三句话"])
 
     def test_segmenter_prefers_punctuation_and_discards_source_footer(self):
         segmenter = SpeechTextSegmenter(first_max_chars=10, max_chars=16)

@@ -53,7 +53,9 @@ class VoiceResponse(Iterator[AudioChunk]):
         self.tts = tts
         self.asr_result = asr_result
         self.prebuffer_ms = float(prebuffer_ms)
-        self.speed = speed
+        self.speed = float(tts.speed if speed is None else speed)
+        if not 0.5 <= self.speed <= 2.0:
+            raise ValueError("speed must be between 0.5 and 2.0")
         self._request_started = request_started
         self._segmenter = SpeechTextSegmenter(
             first_max_chars=first_max_chars,
@@ -168,9 +170,7 @@ class VoiceResponse(Iterator[AudioChunk]):
             return
         with self._lock:
             self._segment_count += 1
-        synthesis_options: dict[str, Any] = {}
-        if self.speed is not None:
-            synthesis_options["speed"] = self.speed
+        synthesis_options: dict[str, Any] = {"speed": self.speed}
         for chunk in self.tts.synthesize_stream(
             text, index=self._audio_chunk_count, cancel_event=self._stop, sanitize=True,
             **synthesis_options,
@@ -182,6 +182,22 @@ class VoiceResponse(Iterator[AudioChunk]):
             self._publish(chunk)
 
     def _produce_text(self) -> None:
+        pending_speech_segments: list[str] = []
+        first_speech_segment = True
+
+        def queue_speech_segment(segment: str) -> None:
+            nonlocal first_speech_segment
+            if first_speech_segment:
+                # Keep the first audio responsive; batch later sentences so TTS
+                # does not repeatedly reset its prosody in the middle of a turn.
+                self._segments.put(segment)
+                first_speech_segment = False
+                return
+            pending_speech_segments.append(segment)
+            if len(pending_speech_segments) >= 2:
+                self._segments.put("。".join(pending_speech_segments))
+                pending_speech_segments.clear()
+
         try:
             with self.response:
                 for text_chunk in self.response:
@@ -193,10 +209,13 @@ class VoiceResponse(Iterator[AudioChunk]):
                                 perf_counter() - self._request_started
                             ) * 1000
                     for segment in self._segmenter.feed(text_chunk):
-                        self._segments.put(segment)
+                        queue_speech_segment(segment)
             if not self._stop.is_set():
                 for segment in self._segmenter.flush():
-                    self._segments.put(segment)
+                    queue_speech_segment(segment)
+                if pending_speech_segments:
+                    self._segments.put("。".join(pending_speech_segments))
+                    pending_speech_segments.clear()
                 self._text_completed_ms = (perf_counter() - self._request_started) * 1000
         except BaseException as exc:
             with self._lock:

@@ -198,6 +198,38 @@ def _normalize_spoken_numbers(text: str) -> str:
     return number_pattern.sub(read_number, text)
 
 
+def _normalize_pcm16_loudness(
+    pcm16: bytes,
+    sample_rate: int,
+    *,
+    previous_gain: float = 1.0,
+    target_rms: float = 3277.0,
+    max_gain: float = 2.0,
+) -> tuple[bytes, float]:
+    """Gently level a streamed PCM chunk, with a short gain ramp at its start."""
+    samples = np.frombuffer(pcm16, dtype="<i2").astype(np.float32)
+    if not samples.size or sample_rate <= 0:
+        return pcm16, previous_gain
+
+    active = np.abs(samples) >= 328.0  # Ignore near-silence when estimating level.
+    if not np.any(active):
+        return pcm16, previous_gain
+
+    measured_rms = float(np.sqrt(np.mean(np.square(samples[active]))))
+    gain = float(np.clip(target_rms / max(measured_rms, 1.0), 0.5, max_gain))
+    peak = float(np.max(np.abs(samples)))
+    if peak:
+        gain = min(gain, 0.95 * 32767.0 / peak)
+
+    ramp_samples = min(samples.size, max(1, int(sample_rate * 0.02)))
+    envelope = np.full(samples.size, gain, dtype=np.float32)
+    envelope[:ramp_samples] = np.linspace(
+        previous_gain, gain, ramp_samples, endpoint=True, dtype=np.float32,
+    )
+    leveled = np.clip(np.rint(samples * envelope), -32768, 32767).astype("<i2")
+    return leveled.tobytes(), gain
+
+
 def sanitize_for_speech(
     text: str, *, pronunciations: Mapping[str, str] | None = None,
 ) -> str:
@@ -219,12 +251,16 @@ def sanitize_for_speech(
     text = re.sub(r"^\s*(?:[-*+] |\d+[.)]\s+)", "", text, flags=re.MULTILINE)
     text = text.replace("^{-1}", "的逆")
     replacements = {
-        r"\times": "乘", r"\cdot": "乘", r"\leq": "小于等于",
+        r"\times": "乘以", r"\cdot": "乘以", r"\div": "除以",
+        "×": "乘以", "÷": "除以", "⁄": "除以", "+": "加", "=": "等于",
+        "−": "减", r"\leq": "小于等于",
         r"\geq": "大于等于", r"\neq": "不等于", "**": "", "__": "",
         "`": "", "$": "", "{": "", "}": "",
     }
     for source, replacement in replacements.items():
         text = text.replace(source, replacement)
+    # Keep parenthetical content, but do not ask TTS to speak the brackets.
+    text = re.sub(r"[()（）]", "", text)
     mapping = dict(_DEFAULT_PRONUNCIATIONS)
     if pronunciations:
         mapping.update(pronunciations)
@@ -494,6 +530,7 @@ class TTSClient:
         self.request_timeout = float(request_timeout)
         self.pronunciations = dict(pronunciations or {})
         self._lock = Lock()
+        self._last_normalizer_gain = 1.0
         self._server_process: subprocess.Popen[bytes] | None = None
         self._ensure_server()
 
@@ -611,6 +648,11 @@ class TTSClient:
                         raise RuntimeError(meta["error"])
                     if meta.get("done"):
                         return
+                    pcm16, self._last_normalizer_gain = _normalize_pcm16_loudness(
+                        pcm16,
+                        int(meta["sample_rate"]),
+                        previous_gain=self._last_normalizer_gain,
+                    )
                     duration_ms = float(meta["duration_ms"])
                     synthesis_ms = float(meta["synthesis_ms"])
                     yield AudioChunk(
