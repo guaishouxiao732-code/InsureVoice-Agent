@@ -6,6 +6,7 @@ from copy import deepcopy
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import Mock
+import re
 from threading import Event
 from time import perf_counter
 import unittest
@@ -17,6 +18,7 @@ from speech import (
     AudioChunk,
     SpeechTextSegmenter,
     _normalize_pcm16_loudness,
+    classify_english_token,
     sanitize_for_speech,
 )
 from voice_assistant import VoiceResponse, VoiceAssistant
@@ -77,10 +79,12 @@ class FakeTTS:
     def __init__(self):
         self.spoken = []
         self.speeds = []
+        self.stream_modes = []
 
-    def synthesize_stream(self, text, *, index, cancel_event, sanitize, speed):
+    def synthesize_stream(self, text, *, index, cancel_event, sanitize, speed, stream):
         self.spoken.append(text)
         self.speeds.append(speed)
+        self.stream_modes.append(stream)
         yield AudioChunk(
             index=index,
             text=text,
@@ -93,6 +97,51 @@ class FakeTTS:
 
 
 class SpeechTests(unittest.TestCase):
+    def test_ai_is_read_as_two_letters_without_changing_other_words(self):
+        self.assertEqual(sanitize_for_speech("我是 AI 保险业务助手。"), "我是 A I 保险业务助手")
+        self.assertEqual(sanitize_for_speech("AI和ai都用于说明；AIGC与PAID不变。"),
+                         "A I和A I都用于说明；A I G C与paid不变")
+
+    def test_english_pronunciation_distinguishes_words_from_initialisms(self):
+        for token in ("AI", "ICU", "BNCT", "VIP", "PDF", "AIGC", "pdf", "XYZ"):
+            with self.subTest(token=token):
+                self.assertEqual(classify_english_token(token), "letters")
+        for token in ("WHO", "IT", "LED", "US"):
+            with self.subTest(token=token):
+                self.assertEqual(classify_english_token(token), "letters")
+        for token in ("Hello", "HELLO", "NASA", "NATO", "COVID", "PLUS", "PAID", "policy"):
+            with self.subTest(token=token):
+                self.assertEqual(classify_english_token(token), "word")
+        for token in ("who", "Who", "it", "led", "us"):
+            with self.subTest(token=token):
+                self.assertEqual(classify_english_token(token), "word")
+        self.assertEqual(
+            sanitize_for_speech("ICU使用BNCT。PDF可读，Hello和NASA不逐字读。"),
+            "ICU使用B N C T。P D F可读，Hello和nasa不逐字读",
+        )
+        self.assertEqual(sanitize_for_speech("ChatGPT与OpenAI"), "Chat G P T与Open A I")
+        self.assertEqual(sanitize_for_speech("WHO与IT确认LED，who led us"),
+                         "W H O与I T确认L E D，who led us")
+        self.assertEqual(sanitize_for_speech("PLUS（2025）版"), "普拉斯二零二五版")
+        self.assertEqual(sanitize_for_speech("storage和RAG"), "storage和检索增强生成")
+        self.assertEqual(sanitize_for_speech("BNCT治疗", pronunciations={"BNCT": "硼中子俘获"}),
+                         "硼中子俘获治疗")
+        self.assertEqual(classify_english_token("DON'T"), "word")
+
+    def test_streamed_english_tokens_are_not_cut_in_the_middle(self):
+        for source, expected in (
+            ("本次保险责任包BNCT治疗费用。", "B N C T"),
+            ("他说OpenAI模型可以回答。", "Open A I"),
+        ):
+            with self.subTest(source=source):
+                segmenter = SpeechTextSegmenter(first_max_chars=8, max_chars=16, min_chars=4)
+                parts = []
+                for character in source:
+                    parts.extend(segmenter.feed(character))
+                parts.extend(segmenter.flush())
+                self.assertIn(expected, "".join(parts))
+                self.assertTrue(any(expected in part for part in parts), parts)
+
     def test_text_completion_does_not_wait_for_slow_tts(self):
         started, release = Event(), Event()
         class SlowTTS(FakeTTS):
@@ -111,7 +160,9 @@ class SpeechTests(unittest.TestCase):
             self.assertLess(voice.metadata["voice"]["text_completed_ms"], 1000)
             self.assertTrue(voice._worker.is_alive())
             release.set()
-            self.assertEqual(len(list(voice)), 2)
+            output_chunks = list(voice)
+            self.assertEqual(len(output_chunks), 3)
+            self.assertEqual(output_chunks[1].duration_ms, 180.0)
         finally:
             release.set()
             voice.close()
@@ -212,15 +263,84 @@ class SpeechTests(unittest.TestCase):
         )
         self.assertEqual(
             spoken,
-            "尊享E生二零二六版：我三十岁，年缴三百一十八元，赔付比例百分之一百，"
+            "尊享伊生二零二六版：我三十岁，年缴三百一十八元，赔付比例百分之一百，"
             "免赔额一万元；保费三千三百一十八点五零元",
         )
         self.assertNotRegex(spoken, r"\d")
+
+    def test_product_name_e_is_spoken_as_english_letter(self):
+        for written in ("尊享e生", "尊享E生", "尊享 e 生", "尊享 E 生"):
+            with self.subTest(written=written):
+                self.assertEqual(sanitize_for_speech(written), "尊享伊生")
+        self.assertEqual(sanitize_for_speech("尊享一生和电子邮件"), "尊享一生和电子邮件")
+
+    def test_streaming_segments_do_not_split_product_name(self):
+        for prefix_length in range(10, 19):
+            for product_name in ("尊享e生", "尊享 E 生"):
+                with self.subTest(prefix_length=prefix_length, product_name=product_name):
+                    segmenter = SpeechTextSegmenter(first_max_chars=16, max_chars=32)
+                    parts = []
+                    for character in "请" * prefix_length + product_name + "可以咨询。":
+                        parts.extend(segmenter.feed(character))
+                    parts.extend(segmenter.flush())
+                    self.assertEqual("".join(parts), "请" * prefix_length + "尊享伊生可以咨询")
+                    self.assertEqual(sum("尊享伊生" in part for part in parts), 1)
 
     def test_sanitizer_reads_division_and_omits_parentheses(self):
         spoken = sanitize_for_speech("计算12÷3，括号内（12+6）乘以2。")
         self.assertEqual(spoken, "计算十二除以三，括号内十二加六乘以二")
         self.assertNotRegex(spoken, r"[()（）÷+×]")
+
+    def test_version_list_reads_years_and_plus_without_speaking_slashes(self):
+        source = "2025/2024/2023/PLUS（2025）版/PLUS"
+        expected = "二零二五、二零二四、二零二三、普拉斯二零二五版，以及普拉斯"
+        self.assertEqual(sanitize_for_speech(source), expected)
+        self.assertEqual(sanitize_for_speech("PLUS（2025）版"), "普拉斯二零二五版")
+        self.assertEqual(sanitize_for_speech("13元/月"), "每月十三元")
+        self.assertEqual(sanitize_for_speech("12/3"), "十二/三")
+
+        segmenter = SpeechTextSegmenter(first_max_chars=24, max_chars=80)
+        segments = []
+        for character in "可选版本：" + source + "。":
+            segments.extend(segmenter.feed(character))
+        segments.extend(segmenter.flush())
+        self.assertEqual("".join(segments), "可选版本：" + expected)
+
+    def test_sanitizer_reads_age_ranges_and_annual_rates_naturally(self):
+        original = (
+            "根据当前费率表，2岁属于0–4岁档，有社保、年缴基础费率为806元/年。"
+            "实际保费以投保页面、核保结果及保险合同为准。"
+        )
+        self.assertEqual(
+            sanitize_for_speech(original),
+            "根据当前费率表，二岁属于零到四岁档，有社保、年缴基础费率为每年八百零六元。"
+            "实际保费以投保页面、核保结果及保险合同为准",
+        )
+        for range_text in ("0—4岁", "0-4岁", "0～4岁"):
+            with self.subTest(range_text=range_text):
+                self.assertEqual(sanitize_for_speech(range_text), "零到四岁")
+        self.assertEqual(sanitize_for_speech("806元／年"), "每年八百零六元")
+        self.assertEqual(sanitize_for_speech("13元/月"), "每月十三元")
+        self.assertEqual(sanitize_for_speech("13元／月"), "每月十三元")
+
+        # Autoplay receives model output incrementally; normalization must
+        # still work when the symbols arrive in separate text deltas.
+        segmenter = SpeechTextSegmenter(first_max_chars=24, max_chars=80)
+        segments = []
+        for character in original:
+            segments.extend(segmenter.feed(character))
+        segments.extend(segmenter.flush())
+        self.assertIn("零到四岁档", "".join(segments))
+        self.assertIn("每年八百零六元", "".join(segments))
+        self.assertNotRegex("".join(segments), r"[–—/／]")
+
+        monthly = SpeechTextSegmenter(first_max_chars=24, max_chars=80)
+        monthly_segments = []
+        for character in "基础费率13元/月，实际保费以合同为准。":
+            monthly_segments.extend(monthly.feed(character))
+        monthly_segments.extend(monthly.flush())
+        self.assertIn("每月十三元", "".join(monthly_segments))
+        self.assertNotIn("/", "".join(monthly_segments))
 
     def test_pcm_loudness_is_leveled_without_clipping(self):
         timeline = np.arange(16_000, dtype=np.float32) / 16_000
@@ -257,7 +377,76 @@ class SpeechTests(unittest.TestCase):
         )
         list(voice)
         self.assertEqual(tts.speeds, [0.9, 0.9])
+        self.assertEqual(tts.stream_modes, [True, True])
         self.assertEqual(tts.spoken, ["第一句话", "第二句话。第三句话"])
+
+    def test_following_segment_can_use_full_synthesis_only_with_enough_buffer(self):
+        class LongFirstTTS(FakeTTS):
+            def synthesize_stream(self, text, **options):
+                chunk = next(super().synthesize_stream(text, **options))
+                if len(self.spoken) == 1:
+                    yield AudioChunk(
+                        index=chunk.index, text=chunk.text,
+                        pcm16=b"\0\0" * (16_000 * 20), sample_rate=16_000,
+                        duration_ms=20_000, synthesis_ms=10, rtf=0.0005,
+                    )
+                else:
+                    yield chunk
+
+        tts = LongFirstTTS()
+        asr = ASRResult("测试", "zh", "", "", 0, 0, 0, 0, ())
+        response = FakeTextResponse(["第一句话。", "第二句话。", "第三句话。"])
+        voice = VoiceResponse(response, tts, asr, request_started=perf_counter(), prebuffer_ms=0)
+        list(voice)
+        self.assertEqual(tts.stream_modes, [True, False])
+        self.assertEqual(response.metadata["voice"]["tts_nonstream_segment_count"], 1)
+
+    def test_cancel_during_full_synthesis_returns_without_waiting(self):
+        started, release = Event(), Event()
+
+        class BlockedFullTTS(FakeTTS):
+            def synthesize_stream(self, text, **options):
+                chunk = next(super().synthesize_stream(text, **options))
+                if options["stream"]:
+                    yield AudioChunk(
+                        index=chunk.index, text=chunk.text,
+                        pcm16=b"\0\0" * (16_000 * 20), sample_rate=16_000,
+                        duration_ms=20_000, synthesis_ms=10, rtf=0.0005,
+                    )
+                else:
+                    started.set()
+                    release.wait(3)
+                    yield chunk
+
+        tts = BlockedFullTTS()
+        asr = ASRResult("测试", "zh", "", "", 0, 0, 0, 0, ())
+        voice = VoiceResponse(
+            FakeTextResponse(["第一句话。", "第二句话。", "第三句话。"]),
+            tts, asr, request_started=perf_counter(), prebuffer_ms=0,
+        )
+        try:
+            self.assertTrue(started.wait(1))
+            before = perf_counter()
+            self.assertTrue(voice.request_cancel())
+            self.assertLess(perf_counter() - before, 0.2)
+            self.assertEqual(tts.stream_modes, [True, False])
+            self.assertEqual(list(voice), [])
+        finally:
+            release.set()
+            voice.close()
+
+    def test_batched_sentences_do_not_add_duplicate_sentence_punctuation(self):
+        tts = FakeTTS()
+        asr = ASRResult("测试", "zh", "", "", 0, 0, 0, 0, ())
+        response = FakeTextResponse(["第一句话！", "第二句话。", "第三句话。"])
+        voice = VoiceResponse(
+            response, tts, asr, request_started=perf_counter(), prebuffer_ms=0,
+        )
+        audio_chunks = list(voice)
+        self.assertEqual(tts.spoken, ["第一句话！", "第二句话。第三句话"])
+        self.assertEqual(len(audio_chunks), 3)
+        self.assertEqual(audio_chunks[1].text, "")
+        self.assertEqual(audio_chunks[1].duration_ms, 180.0)
 
     def test_segmenter_prefers_punctuation_and_discards_source_footer(self):
         segmenter = SpeechTextSegmenter(first_max_chars=10, max_chars=16)
@@ -266,6 +455,33 @@ class SpeechTests(unittest.TestCase):
             output.extend(segmenter.feed(chunk))
         output.extend(segmenter.flush())
         self.assertEqual(output, ["可逆矩阵是方阵", "它存在逆矩阵"])
+
+    def test_long_complete_first_sentence_releases_earliest_natural_clause(self):
+        source = (
+            "根据当前费率表，35岁属于31–35岁档，"
+            "有社保、年缴基础费率为423元/年。"
+            "实际保费以投保页面、核保结果及保险合同为准。"
+        )
+        segmenter = SpeechTextSegmenter(first_max_chars=24, max_chars=80)
+        output = segmenter.feed(source)
+        output.extend(segmenter.flush())
+        self.assertEqual(output[0], "根据当前费率表，")
+        self.assertEqual(
+            "".join(output),
+            re.sub(r"[。！？!?；;]", "", sanitize_for_speech(source)),
+        )
+
+        # The low-latency boundary remains outside protected product names and
+        # English initialisms.
+        protected = SpeechTextSegmenter(first_max_chars=24, max_chars=80)
+        protected_source = "根据尊享e生和BNCT责任，这是一条较长的完整回答。"
+        protected_output = protected.feed(protected_source)
+        protected_output.extend(protected.flush())
+        self.assertEqual(protected_output[0], "根据尊享伊生和B N C T责任，")
+        self.assertEqual(
+            "".join(protected_output),
+            re.sub(r"[。！？!?；;]", "", sanitize_for_speech(protected_source)),
+        )
 
     def test_voice_response_streams_audio_and_records_only_metadata(self):
         response = FakeTextResponse([
@@ -289,7 +505,8 @@ class SpeechTests(unittest.TestCase):
             response, tts, asr, request_started=0, prebuffer_ms=1_000,
         )
         chunks = list(voice)
-        self.assertEqual(len(chunks), 2)
+        self.assertEqual(len(chunks), 3)
+        self.assertEqual(chunks[1].duration_ms, 180.0)
         self.assertEqual(tts.spoken, ["可逆矩阵是一种方阵", "它具有唯一的逆矩阵"])
         metadata = response.metadata["voice"]
         self.assertEqual(metadata["transcript"], "什么是可逆矩阵？")

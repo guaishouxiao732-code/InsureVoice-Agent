@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 from io import BytesIO
 import json
 import os
@@ -19,6 +20,7 @@ from urllib.request import Request, urlopen
 import wave
 
 import numpy as np
+import cmudict
 import sherpa_onnx
 
 from project_config import PROJECT_ROOT, cosyvoice_python, project_path
@@ -108,13 +110,100 @@ def _apply_corrections(text: str, corrections: Mapping[str, str] | None) -> str:
     for source, replacement in sorted(corrections.items(), key=lambda item: -len(item[0])):
         if not source:
             continue
-        text = re.sub(re.escape(source), lambda _: replacement, text, flags=re.IGNORECASE)
+        pattern = re.escape(source)
+        if source[0].isascii() and source[0].isalpha():
+            pattern = r"(?<![A-Za-z])" + pattern
+        if source[-1].isascii() and source[-1].isalpha():
+            pattern += r"(?![A-Za-z])"
+        text = re.sub(pattern, lambda _: replacement, text, flags=re.IGNORECASE)
     return text
 
 
 _CHINESE_DIGITS = "零一二三四五六七八九"
 _CHINESE_SMALL_UNITS = ("", "十", "百", "千")
 _CHINESE_GROUP_UNITS = ("", "万", "亿", "兆")
+_VERSION_ITEM = r"(?:20\d{2}(?:年|版|款)?|PLUS(?:\s*[（(]\s*20\d{2}\s*[）)])?(?:版|款)?)"
+_VERSION_LIST = re.compile(
+    rf"(?<![A-Za-z0-9]){_VERSION_ITEM}(?:\s*[/／]\s*{_VERSION_ITEM})+(?![A-Za-z0-9])",
+    re.IGNORECASE,
+)
+_VERSION_LIST_HEAD = re.compile(
+    r"(?<![A-Za-z0-9])(?:20\d{2}|PLUS(?:\s*[（(]\s*20\d{2}\s*[）)])?(?:版|款)?)"
+    r"\s*[/／]\s*(?:20\d{2}|PLUS)",
+    re.IGNORECASE,
+)
+_PRODUCT_NAME_E = re.compile(r"尊享[ \t\u00a0]*[eE][ \t\u00a0]*生")
+_PRODUCT_NAME_PREFIX = re.compile(r"尊(?:享(?:[ \t\u00a0]*[eE]?[ \t\u00a0]*)?)?$")
+_ENGLISH_TOKEN = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?")
+_CASE_BOUNDARY = re.compile(r"(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
+_KNOWN_INITIALISMS = frozenset({
+    "AI", "AIGC", "API", "ASR", "BNCT", "CPU", "CT", "GPU", "GPT", "HTTP", "HTTPS",
+    "ICU", "LLM", "MRI", "OCR", "PDF", "RAG", "SQL", "TTS", "URL", "VIP",
+})
+_UPPERCASE_ONLY_INITIALISMS = frozenset({"WHO", "IT", "LED"})
+_SPOKEN_AS_WORD = frozenset({"COVID"})
+_RAW_LETTER_TOKENS = frozenset({"ICU", "VIP"})
+
+
+@lru_cache(maxsize=1)
+def _english_lexicon() -> dict[str, list[list[str]]]:
+    """Load the offline pronunciation lexicon once, never per TTS segment."""
+    return cmudict.dict()
+
+
+def _is_spelled_pronunciation(token: str, pronunciation: list[str]) -> bool:
+    lexicon = _english_lexicon()
+    expected: list[str] = []
+    for letter in token.lower():
+        variants = lexicon.get(letter)
+        if not variants:
+            return False
+        # 'a' has both the unstressed article and the letter name A.
+        phonemes = variants[-1] if letter == "a" else variants[0]
+        expected.extend(re.sub(r"\d", "", phone) for phone in phonemes)
+    actual = [re.sub(r"\d", "", phone) for phone in pronunciation]
+    return actual == expected
+
+
+@lru_cache(maxsize=8192)
+def classify_english_token(token: str) -> str:
+    """Return 'letters' or 'word' using casing and offline pronunciations."""
+    if not token or not re.fullmatch(r"[A-Za-z]+(?:'[A-Za-z]+)?", token):
+        raise ValueError("token must be an English alphabetic word")
+    if "'" in token:
+        return "word"
+    upper = token.upper()
+    if len(token) == 1 or upper in _KNOWN_INITIALISMS or token in _UPPERCASE_ONLY_INITIALISMS:
+        return "letters"
+    if upper in _SPOKEN_AS_WORD:
+        return "word"
+    pronunciations = _english_lexicon().get(token.lower(), [])
+    if token.isupper():
+        if pronunciations:
+            return "letters" if any(_is_spelled_pronunciation(upper, item) for item in pronunciations) else "word"
+        return "letters"
+    if token.islower() and not pronunciations and len(token) <= 4:
+        return "letters"
+    return "word"
+
+
+def _normalize_english_pronunciation(text: str) -> str:
+    """Spell initialisms, keep pronounceable English words as whole words."""
+    def render(match: re.Match[str]) -> str:
+        token = match.group()
+        parts = _CASE_BOUNDARY.split(token)
+        spoken: list[str] = []
+        for part in parts:
+            if classify_english_token(part) == "letters":
+                spoken.append(part.upper() if part.upper() in _RAW_LETTER_TOKENS else " ".join(part.upper()))
+            else:
+                # The TTS engine may spell an all-caps *word* even when the
+                # lexicon classifies it correctly (observed with NASA). Lowercase
+                # sounded more natural than title case in the listening check.
+                spoken.append(part.lower() if part.isupper() else part)
+        return " ".join(spoken)
+
+    return _ENGLISH_TOKEN.sub(render, text)
 
 
 def _integer_to_chinese(value: int) -> str:
@@ -175,8 +264,46 @@ def _number_to_chinese(value: str, *, digitwise: bool = False) -> str:
     return f"{whole}点{decimals}" if decimals else whole
 
 
+def _normalize_spoken_version_lists(text: str) -> str:
+    """Read slash-separated product versions without changing monetary rates."""
+    def read_list(match: re.Match[str]) -> str:
+        raw = match.group()
+        # A bare year/year expression is ambiguous; require an explicit
+        # product-version marker before interpreting slashes as separators.
+        if not re.search(r"PLUS|[版款]", raw, re.IGNORECASE):
+            return raw
+        spoken: list[str] = []
+        for item in re.split(r"\s*[/／]\s*", raw):
+            plus = re.fullmatch(
+                r"PLUS(?:\s*[（(]\s*(20\d{2})\s*[）)])?\s*(版|款)?",
+                item, re.IGNORECASE,
+            )
+            if plus:
+                year = _number_to_chinese(plus.group(1), digitwise=True) if plus.group(1) else ""
+                spoken.append(f"普拉斯{year}{plus.group(2) or ''}")
+                continue
+            year = re.fullmatch(r"(20\d{2})(年|版|款)?", item)
+            if year:
+                spoken.append(_number_to_chinese(year.group(1), digitwise=True) + (year.group(2) or ""))
+        return "、".join(spoken[:-1]) + "，以及" + spoken[-1]
+
+    return _VERSION_LIST.sub(read_list, text)
+
+
 def _normalize_spoken_numbers(text: str) -> str:
     """Convert Arabic numerals for speech only, leaving displayed answers intact."""
+    # A range dash is not spoken reliably by CosyVoice. Convert it before the
+    # individual numbers so "0–4岁" becomes "零到四岁", not "零四岁".
+    text = re.sub(r"(?<=\d)\s*[–—－~～]\s*(?=\d)", "到", text)
+    text = re.sub(r"(?<=\d)\s*-\s*(?=\d+(?:\.\d+)?\s*(?:周?岁|年|月|天|日))", "到", text)
+
+    # Read annual and monthly monetary rates as natural phrases. Keep the written
+    # answer untouched; this function is used only for speech preparation.
+    text = re.sub(
+        r"(?P<amount>(?<![\d.])(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)\s*元\s*[/／]\s*(?P<period>[年月])",
+        lambda match: f"每{match.group('period')}{match.group('amount')}元",
+        text,
+    )
     number_pattern = re.compile(r"(?<![\d.])(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?![\d.])")
 
     def read_percent(match: re.Match[str]) -> str:
@@ -204,7 +331,7 @@ def _normalize_pcm16_loudness(
     *,
     previous_gain: float = 1.0,
     target_rms: float = 3277.0,
-    max_gain: float = 2.0,
+    max_gain: float = 3.0,
 ) -> tuple[bytes, float]:
     """Level short speech windows so a quiet trailing syllable stays audible."""
     samples = np.frombuffer(pcm16, dtype="<i2").astype(np.float32)
@@ -267,12 +394,18 @@ def sanitize_for_speech(
     }
     for source, replacement in replacements.items():
         text = text.replace(source, replacement)
+    text = _normalize_spoken_version_lists(text)
+    # The product name uses the English letter e; Chinese TTS otherwise tends
+    # to pronounce the bare letter as the pinyin vowel "e" (俄).
+    text = _PRODUCT_NAME_E.sub("尊享伊生", text)
     # Keep parenthetical content, but do not ask TTS to speak the brackets.
     text = re.sub(r"[()（）]", "", text)
+    text = re.sub(r"(?<![A-Za-z])PLUS(?![A-Za-z])", "普拉斯", text, flags=re.IGNORECASE)
     mapping = dict(_DEFAULT_PRONUNCIATIONS)
     if pronunciations:
         mapping.update(pronunciations)
     text = _apply_corrections(text, mapping)
+    text = _normalize_english_pronunciation(text)
     text = _normalize_spoken_numbers(text)
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\s*\n+\s*", "。", text)
@@ -301,10 +434,34 @@ class SpeechTextSegmenter:
         return sanitize_for_speech(text, pronunciations=self.pronunciations)
 
     def _next_boundary(self) -> int | None:
-        for match in re.finditer(r"[。！？!?；;\n]", self._buffer):
-            if len(self._clean(self._buffer[:match.end()])) >= self.min_chars:
-                return match.end()
         limit = self.first_max_chars if self._emitted == 0 else self.max_chars
+        for match in re.finditer(r"[。！？!?；;\n]", self._buffer):
+            sentence_length = len(self._clean(self._buffer[:match.end()]))
+            if sentence_length >= self.min_chars:
+                # A complete fixed-rule answer can arrive in one text chunk.
+                # For a long first sentence, release its earliest natural
+                # clause instead of waiting for the terminal punctuation; this
+                # lets TTS start sooner without cutting a protected token.
+                if self._emitted == 0 and sentence_length > limit:
+                    natural_boundaries = [
+                        index + 1
+                        for index, char in enumerate(self._buffer[:match.end()])
+                        if char in "，,：:"
+                        and self.min_chars
+                        <= len(self._clean(self._buffer[:index + 1]))
+                        <= limit
+                    ]
+                    if natural_boundaries:
+                        return natural_boundaries[0]
+                return match.end()
+        # Wait for the whole version list instead of splitting PLUS（2025）版
+        # in the middle when model text arrives character by character.
+        version_head = _VERSION_LIST_HEAD.search(self._buffer)
+        if version_head and len(self._buffer) - version_head.start() <= self.max_chars:
+            ending = re.search(r"[，,：:]", self._buffer[version_head.start():])
+            if ending:
+                return version_head.start() + ending.end()
+            return None
         clean = self._clean(self._buffer)
         if len(clean) < limit:
             return None
@@ -314,8 +471,21 @@ class SpeechTextSegmenter:
         ]
         if candidates:
             return candidates[-1]
+        # Wait for a partially streamed product name, then keep the full name
+        # together even when the character limit falls inside it.
+        if _PRODUCT_NAME_PREFIX.search(self._buffer):
+            return None
         for index in range(1, len(self._buffer) + 1):
             if len(self._clean(self._buffer[:index])) >= limit:
+                for match in _PRODUCT_NAME_E.finditer(self._buffer):
+                    if match.start() < index < match.end():
+                        return match.end()
+                for match in _ENGLISH_TOKEN.finditer(self._buffer):
+                    if match.start() < index <= match.end():
+                        # A character-streamed acronym can still grow on the
+                        # next model token. Wait rather than speaking "B" and
+                        # then "NCT" as two unrelated segments.
+                        return None if match.end() == len(self._buffer) else match.end()
                 return index
         return len(self._buffer)
 
@@ -546,6 +716,7 @@ class TTSClient:
 
     def warmup(self) -> None:
         """Warm CosyVoice kernels without persisting the generated audio."""
+        _english_lexicon()
         list(self.synthesize_stream("准备就绪。", sanitize=False))
 
     def _health(self, timeout: float = 1.0) -> dict[str, Any]:
@@ -629,18 +800,21 @@ class TTSClient:
         speed: float | None = None,
         cancel_event: Event | None = None,
         sanitize: bool = True,
+        stream: bool = True,
     ) -> Iterator[AudioChunk]:
         spoken = sanitize_for_speech(text, pronunciations=self.pronunciations) if sanitize else text.strip()
         if not spoken:
             raise ValueError("text contains no speakable body content")
         selected_speaker = self.speaker if speaker is None else speaker
         selected_speed = self.speed if speed is None else speed
+        if not isinstance(stream, bool):
+            raise TypeError("stream must be a boolean")
         stop = cancel_event or Event()
         request = Request(
             f"{self.server_url}/synthesize",
             data=json.dumps({
                 "text": spoken, "speaker": selected_speaker, "speed": selected_speed,
-                "seed": self.seed,
+                "seed": self.seed, "stream": stream,
             }, ensure_ascii=False).encode("utf-8"),
             headers={"Content-Type": "application/json"}, method="POST",
         )
@@ -740,5 +914,5 @@ __all__ = [
     "ASRClient", "ASRResult", "AudioChunk", "DEFAULT_ASR_MODEL_PATH",
     "DEFAULT_COSYVOICE_PYTHON", "DEFAULT_COSYVOICE_URL", "DEFAULT_TTS_MODEL_PATH",
     "DEFAULT_TTS_SPEAKER", "SpeechTextSegmenter",
-    "TTSClient", "sanitize_for_speech", "save_audio_chunks",
+    "TTSClient", "sanitize_for_speech", "classify_english_token", "save_audio_chunks",
 ]

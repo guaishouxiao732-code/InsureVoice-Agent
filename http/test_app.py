@@ -113,7 +113,10 @@ class VoiceProtocolTests(unittest.TestCase):
         response = FakeResponse("测试回答")
         response.transcript = "年缴多少钱"
         voice = SimpleNamespace(stream_chat=Mock(return_value=response))
-        fake = SimpleNamespace(state="ready", context=FakeContext(), voice=voice, close=lambda: None)
+        fake = SimpleNamespace(
+            state="ready", context=FakeContext(), voice=voice,
+            interrupt=lambda _session_id: False, close=lambda: None,
+        )
         with patch.object(gateway, "runtime", fake), patch.object(gateway, "_decode_browser_audio", return_value=b"wav"), TestClient(app) as client:
             with client.websocket_connect("/ws") as ws:
                 self.receive_until(ws, "history")
@@ -125,6 +128,23 @@ class VoiceProtocolTests(unittest.TestCase):
                 self.assertEqual(audio["sample_rate"], 16000)
                 self.assertEqual(self.receive_until(ws, "turn_done")["text"], "测试回答")
         voice.stream_chat.assert_called_once_with("test-session", b"wav", tts_speed=1.0, cancel_event=ANY, thinking_mode="auto")
+
+    def test_replay_uses_full_utterance_synthesis(self):
+        chunk = SimpleNamespace(pcm16=bytes(3200), sample_rate=16000, duration_ms=100)
+        def audio_chunks(*_args, **_kwargs):
+            yield chunk
+        tts = SimpleNamespace(synthesize_stream=Mock(side_effect=audio_chunks))
+        fake = SimpleNamespace(state="ready", context=FakeContext(), tts=tts, close=lambda: None)
+        with patch.object(gateway, "runtime", fake), TestClient(app) as client:
+            with client.websocket_connect("/ws") as ws:
+                self.receive_until(ws, "history")
+                ws.send_json({"type": "speak", "text": "2岁属于0–4岁档，806元/年。", "speed": 1.0})
+                self.receive_until(ws, "audio_chunk")
+                self.receive_until(ws, "audio_end")
+        tts.synthesize_stream.assert_called_once_with(
+            "2岁属于0–4岁档，806元/年。",
+            speed=1.0, cancel_event=ANY, stream=False,
+        )
 
     def test_text_handoff_metadata_reaches_websocket_and_restored_history(self):
         from context_manager import ContextManager

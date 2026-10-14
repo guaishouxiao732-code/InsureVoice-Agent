@@ -70,6 +70,7 @@ class AssistantRuntime:
                     speaker=os.environ.get("TTS_SPEAKER", "中文女"),
                     speed=float(os.environ.get("TTS_SPEED", "1.0")),
                     device=os.environ.get("TTS_DEVICE", "cuda:0"),
+                    server_url=os.environ.get("TTS_SERVER_URL") or None,
                 )
                 retriever = RAGRetriever(embedding_device="cpu")
                 qwen = Qwen3Client(device=os.environ.get("QWEN_DEVICE", "cuda:1"))
@@ -148,9 +149,9 @@ def _public_turn(turn: dict[str, Any]) -> dict[str, Any]:
 
 def _mode_options(mode: str) -> dict[str, Any]:
     if mode == "slow":
-        return {"thinking_mode": "slow", "max_new_tokens": 768, "temperature": 0.2, "top_p": 0.8}
+        return {"thinking_mode": "slow", "max_new_tokens": 512, "temperature": 0.0, "top_p": 0.8}
     if mode == "fast":
-        return {"thinking_mode": "fast", "max_new_tokens": 384, "temperature": 0.2, "top_p": 0.8}
+        return {"thinking_mode": "fast", "max_new_tokens": 192, "temperature": 0.0, "top_p": 0.8}
     return {"thinking_mode": "auto"}
 
 
@@ -439,7 +440,11 @@ async def assistant_socket(websocket: WebSocket) -> None:
         try:
             await _ensure_ready()
             await send({"type": "audio_reset"})
-            iterator = runtime.tts.synthesize_stream(text, speed=speed, cancel_event=stop)
+            # Replay can wait for full-utterance synthesis; unlike first-response
+            # autoplay it does not need to meet the low-latency first-audio gate.
+            iterator = runtime.tts.synthesize_stream(
+                text, speed=speed, cancel_event=stop, stream=False,
+            )
             while True:
                 available, chunk = await _next(iterator)
                 if response_context.get() != response_serial:

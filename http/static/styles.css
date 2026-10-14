@@ -128,9 +128,23 @@ textarea { flex: 1; max-height: 130px; padding: 10px 8px; resize: none; border: 
 @keyframes pulse { 50% { opacity: .25; transform: scale(.7); } }
 .evidence-empty { color: var(--muted); font-size: 12px; line-height: 1.8; }
 .evidence-summary { padding: 12px; border-radius: 13px; background: #eff6ff; font-size: 12px; line-height: 1.7; }
+.evidence-claims { margin-top: 10px; display: grid; gap: 8px; }
+.evidence-claim { padding: 10px; border: 1px solid #bfdbfe; border-radius: 11px; background: #f8fbff; overflow-wrap: anywhere; }
+.evidence-claim.unverified { border-color: #fbbf24; background: #fffbeb; }
+.evidence-claim p { margin: 0 0 5px; font-size: 12px; line-height: 1.6; }
+.evidence-claim small { display: block; color: #475569; font-size: 11px; }
+.evidence-claim button { display: block; margin-top: 5px; padding: 0; border: 0; color: var(--blue); background: transparent; font-size: 11px; text-align: left; overflow-wrap: anywhere; }
+.evidence-search { position: sticky; top: 0; z-index: 2; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 6px; margin-top: 10px; padding: 9px 0; background: var(--panel); }
+.evidence-search input { min-width: 0; padding: 8px 9px; border: 1px solid #cbd5e1; border-radius: 9px; outline: 0; color: #0f172a; background: white; font-size: 12px; }
+.evidence-search input:focus { border-color: #60a5fa; box-shadow: 0 0 0 2px #dbeafe; }
+.evidence-search button { padding: 7px 9px; border: 1px solid #bfdbfe; border-radius: 9px; color: var(--blue-dark); background: #eff6ff; font-size: 11px; }
+.evidence-search button:disabled { cursor: default; opacity: .5; }
+.evidence-search small { grid-column: 1 / -1; color: var(--muted); font-size: 11px; }
 .source-card { margin-top: 10px; padding: 12px; border: 1px solid var(--line); border-radius: 13px; background: white; }
 .source-card header { display: flex; justify-content: space-between; color: var(--blue); font-size: 11px; font-weight: 700; }
-.source-card p { margin: 8px 0 0; color: #475569; font-size: 11px; line-height: 1.65; }
+.source-card p { margin: 8px 0 0; color: #475569; font-size: 11px; line-height: 1.65; white-space: pre-wrap; overflow-wrap: anywhere; }
+.evidence-highlight { border-radius: 3px; color: #713f12; background: #fef08a; box-decoration-break: clone; }
+.evidence-highlight.active { outline: 2px solid #ea580c; color: #431407; background: #fdba74; }
 .login-layer, .modal-layer { position: fixed; inset: 0; z-index: 50; display: grid; place-items: center; padding: 20px; background: #eff6ff; }
 .login-card, .settings-card { width: min(100%, 420px); padding: 30px; border: 1px solid var(--line); border-radius: 24px; background: white; box-shadow: var(--shadow); }
 .login-card .brand-mark { margin: 0 auto 18px; }

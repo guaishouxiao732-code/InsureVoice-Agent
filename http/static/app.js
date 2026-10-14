@@ -155,9 +155,17 @@ function createTurn(question, mode, options = {}) {
   turn._metadata = options.metadata || {};
   turn._mode = mode;
   turn._route = modeLabel;
+  updateEvidenceChip(turn);
   $('#messages').append(turn);
   scrollBottom();
   return turn;
+}
+
+function updateEvidenceChip(turn) {
+  const chip = turn.querySelector('[data-action="sources"]');
+  if (!chip) return;
+  const count = Number(turn._metadata?.evidence_audit?.unverified_claims || 0);
+  chip.textContent = count > 0 ? `查看回答依据（${count}条待核实）` : '查看回答依据';
 }
 
 function renderHistory(turns) {
@@ -213,14 +221,121 @@ function syncSessionSelection() {
   });
 }
 
-function renderEvidence(metadata = {}) {
+const EVIDENCE_GENERIC_WORDS = new Set([
+  '什么', '怎么', '如何', '是否', '可以', '请问', '告诉', '具体', '相关', '问题',
+  '回答', '依据', '来源', '资料', '哪个', '哪些', '多少', '这个', '那个',
+  '刚才', '之前', '给出', '根据', '当前', '如果', '以及', '还有', '需要',
+]);
+
+function foldEvidenceText(value) {
+  // ASCII-only folding preserves character offsets for Chinese and punctuation.
+  return value.replace(/[A-Z]/g, char => char.toLowerCase());
+}
+
+function evidenceKeywords(question, sourceTexts) {
+  const words = [];
+  const written = escapeText(question);
+  if (typeof Intl.Segmenter === 'function') {
+    const segmenter = new Intl.Segmenter('zh', {granularity: 'word'});
+    for (const part of segmenter.segment(written)) {
+      if (part.isWordLike) words.push(part.segment);
+    }
+  } else {
+    words.push(...(written.match(/[A-Za-z0-9]+/g) || []));
+  }
+  // Chinese segmenters may split domain terms such as “年缴费率” into single
+  // characters. Add short source-confirmed phrases so they remain findable.
+  for (const block of written.match(/[\u3400-\u9fff]{2,}/g) || []) {
+    for (let size = Math.min(5, block.length); size >= 2; size--) {
+      for (let start = 0; start <= block.length - size; start++) {
+        words.push(block.slice(start, start + size));
+      }
+    }
+  }
+  words.push(...(written.match(/\d{1,3}\s*岁/g) || []));
+  const available = sourceTexts.map(foldEvidenceText);
+  return [...new Set(words.map(word => word.trim()).filter(word =>
+    word.length >= 2 && !EVIDENCE_GENERIC_WORDS.has(word) &&
+    !/^\d$/.test(word) && available.some(text => text.includes(foldEvidenceText(word)))
+  ))].sort((left, right) => right.length - left.length).slice(0, 8);
+}
+
+function highlightEvidenceText(element, source, keywords) {
+  const text = escapeText(source);
+  const folded = foldEvidenceText(text);
+  const ranges = [];
+  for (const keyword of keywords) {
+    const needle = foldEvidenceText(keyword);
+    if (!needle) continue;
+    let from = 0;
+    while (from < folded.length) {
+      const start = folded.indexOf(needle, from);
+      if (start < 0) break;
+      ranges.push({start, end: start + needle.length});
+      from = start + needle.length;
+    }
+  }
+  ranges.sort((left, right) => left.start - right.start || right.end - left.end);
+  if (!ranges.length) {
+    element.textContent = text;
+    return [];
+  }
+  element.replaceChildren();
+  const marks = [];
+  let cursor = 0;
+  for (const range of ranges) {
+    if (range.start < cursor) continue;
+    if (range.start > cursor) {
+      const plain = document.createElement('span');
+      plain.textContent = text.slice(cursor, range.start);
+      element.append(plain);
+    }
+    const mark = document.createElement('mark');
+    mark.className = 'evidence-highlight';
+    mark.textContent = text.slice(range.start, range.end);
+    element.append(mark);
+    marks.push(mark);
+    cursor = range.end;
+  }
+  if (cursor < text.length) {
+    const plain = document.createElement('span');
+    plain.textContent = text.slice(cursor);
+    element.append(plain);
+  }
+  return marks;
+}
+
+function renderEvidence(metadata = {}, question = '', answer = '') {
   const panel = $('#evidence-content');
   panel.replaceChildren();
-  const sources = metadata.knowledge_mode === 'rag'
+  let sources = metadata.knowledge_mode === 'rag'
     ? (metadata.evidence_sources || metadata.sources || []) : (metadata.sources || []);
+  // Older turns may contain a generated premium next to unrelated retrieved
+  // policy clauses. Never present those clauses as proof of the quoted amount.
+  const premium = metadata.knowledge_mode === 'rag'
+    ? escapeText(answer).match(/([\d,]+)\s*元\s*\/\s*(年|月)/) : null;
+  if (premium) {
+    const amount = premium[1].replace(/,/g, '');
+    const period = premium[2] === '年' ? '年缴' : '月缴';
+    const numeric = new RegExp(`(^|\\D)${amount}(?!\\d)`);
+    sources = sources.filter(source => {
+      const name = escapeText(source.source_name);
+      const body = escapeText(source.text).replace(/,/g, '');
+      return name.includes('费率') && name.includes(period) && numeric.test(body);
+    });
+  }
+  const missingPremiumBasis = Boolean(premium && !sources.length);
   const summary = document.createElement('div');
   summary.className = 'evidence-summary';
-  if (metadata.knowledge_mode === 'rag') {
+  if (missingPremiumBasis) {
+    summary.textContent = '这条已保存的保费回答缺少可核验的对应费率表依据，原检索片段不能证明该金额。请重新提问；仍无法核实时需转人工处理。';
+  } else if (metadata.evidence_audit?.unverified_claims) {
+    summary.textContent = `回答完成后发现 ${metadata.evidence_audit.unverified_claims} 条保险结论未匹配到足够的原文依据，需人工核实；下方只展示与结论匹配的候选片段。`;
+  } else if (metadata.evidence_audit?.matched_claims) {
+    summary.textContent = `已按 ${metadata.evidence_audit.matched_claims} 条保险结论自动匹配原文片段；这不是独立的语义真伪核验，请核对适用条件。`;
+  } else if (metadata.knowledge_mode === 'rag' && metadata.cooperation?.stages?.includes('fast:exact_rate_lookup')) {
+    summary.textContent = `本轮基础费率按当前记录的用户条件从下列费率表读取；用户条件不是保险条款证据。检索 ${Math.round(metadata.retrieval_ms || 0)} ms`;
+  } else if (metadata.knowledge_mode === 'rag') {
     summary.textContent = `提供给模型的检索资料（非逐条结论核验） · 检索 ${Math.round(metadata.retrieval_ms || 0)} ms · 最高相似度 ${(metadata.top_score || 0).toFixed(3)}`;
   } else if (metadata.knowledge_mode === 'handoff') {
     summary.textContent = '当前保险资料证据不足，未使用模型知识补充。待人工处理，尚未接入人工客服；下列候选片段未作为回答依据。';
@@ -247,6 +362,7 @@ function renderEvidence(metadata = {}) {
     details.textContent = `协同路径：${cooperationLabel(plan)} · 条件版本 ${plan.context_version}。用户表述（非条款证据）：${conditions || '暂无已提取条件'}。`;
     panel.append(details);
   }
+  const sourceRecords = [];
   sources.forEach((source, index) => {
     const card = document.createElement('article');
     card.className = 'source-card';
@@ -254,19 +370,98 @@ function renderEvidence(metadata = {}) {
     const page = document.createElement('span');
     const sourceName = source.source_name || 'PDF';
     const location = source.location || `第 ${source.pdf_page} 页`;
-    page.textContent = `${sourceName} · ${location}`;
+    const title = `${sourceName} · ${location}`;
+    page.textContent = title;
     const score = document.createElement('span');
     score.textContent = `相似度 ${Number(source.score || 0).toFixed(3)}`;
     header.append(page, score);
     const text = document.createElement('p');
-    text.textContent = escapeText(source.text).slice(0, 360);
+    const body = escapeText(source.text);
+    text.textContent = body;
     card.append(header, text);
     panel.append(card);
+    sourceRecords.push({id: source.chunk_id, card, page, title, text, body});
   });
+  if (Array.isArray(metadata.evidence_claims) && metadata.evidence_claims.length) {
+    const claimList = document.createElement('div');
+    claimList.className = 'evidence-claims';
+    for (const claim of metadata.evidence_claims) {
+      const item = document.createElement('article');
+      item.className = `evidence-claim ${claim.status === 'source_match' ? 'matched' : 'unverified'}`;
+      const statement = document.createElement('p');
+      statement.textContent = claim.claim;
+      const label = document.createElement('small');
+      label.textContent = claim.status !== 'source_match'
+        ? '待人工核实：未找到足够匹配的原文'
+        : claim.support_kind === 'base_exception_inference'
+          ? '依据一般规则与例外规则推导（两条原文均列于下方，请核对适用条件）'
+          : '对应原文片段（自动匹配）';
+      item.append(statement, label);
+      for (const id of claim.source_ids || []) {
+        const source = sourceRecords.find(record => record.id === id);
+        if (!source) continue;
+        const link = document.createElement('button');
+        link.type = 'button';
+        link.textContent = source.title;
+        link.addEventListener('click', () => source.card.scrollIntoView({block: 'center', behavior: 'smooth'}));
+        item.append(link);
+      }
+      claimList.append(item);
+    }
+    panel.insertBefore(claimList, sourceRecords[0]?.card || null);
+  }
+  if (sourceRecords.length) {
+    const search = document.createElement('div');
+    search.className = 'evidence-search';
+    const input = document.createElement('input');
+    input.type = 'search';
+    input.maxLength = 80;
+    input.placeholder = '搜索依据关键词';
+    input.setAttribute('aria-label', '搜索回答依据中的关键词');
+    const next = document.createElement('button');
+    next.type = 'button';
+    next.textContent = '下一处';
+    next.setAttribute('aria-label', '跳到下一处关键词');
+    const status = document.createElement('small');
+    status.setAttribute('role', 'status');
+    search.append(input, next, status);
+    panel.insertBefore(search, sourceRecords[0].card);
+
+    const effectiveQuestion = metadata.query || metadata.cooperation?.query || question;
+    const automatic = evidenceKeywords(effectiveQuestion, sourceRecords.flatMap(record => [record.title, record.body]));
+    let marks = [];
+    let active = -1;
+    const refresh = () => {
+      const typed = input.value.trim();
+      const terms = typed ? [...new Set(typed.split(/[\s,，、;；]+/).filter(Boolean))].slice(0, 8) : automatic;
+      marks = sourceRecords.flatMap(record => [
+        ...highlightEvidenceText(record.page, record.title, terms),
+        ...highlightEvidenceText(record.text, record.body, terms),
+      ]);
+      active = -1;
+      next.disabled = !marks.length;
+      status.textContent = typed
+        ? (marks.length ? `找到 ${marks.length} 处匹配` : '未找到匹配关键词')
+        : (marks.length ? `根据问题及有效上下文自动高亮 ${marks.length} 处` : '输入关键词可查找片段');
+    };
+    const jumpNext = () => {
+      if (!marks.length) return;
+      if (active >= 0) marks[active].classList.remove('active');
+      active = (active + 1) % marks.length;
+      marks[active].classList.add('active');
+      marks[active].scrollIntoView({block: 'center', behavior: 'smooth'});
+    };
+    input.addEventListener('input', refresh);
+    input.addEventListener('keydown', event => {
+      if (event.key === 'Enter') { event.preventDefault(); jumpNext(); }
+    });
+    next.addEventListener('click', jumpNext);
+    refresh();
+  }
   if (!sources.length) {
     const empty = document.createElement('p');
     empty.className = 'evidence-empty';
-    empty.textContent = '没有可展示的保险资料片段。';
+    empty.textContent = missingPremiumBasis ? '未找到与该保费匹配的费率表片段。' : '没有可展示的保险资料片段。';
     panel.append(empty);
   }
   openPanel('evidence');
@@ -307,6 +502,31 @@ async function ensureAudio() {
     state.audioCursor = 0;
   }
   if (state.audioContext.state === 'suspended') await state.audioContext.resume();
+}
+
+function primeAudioFromGesture() {
+  // Browsers may keep resume() pending until a user gesture starts a source.
+  // Do both synchronously in the Play click; never delay the TTS request while
+  // waiting for resume(), or another click could be required to hear it.
+  try {
+    if (!state.audioContext || state.audioContext.state === 'closed') {
+      state.audioContext = new (window.AudioContext || window.webkitAudioContext)();
+      state.audioCursor = 0;
+    }
+    const context = state.audioContext;
+    if (context.state === 'suspended') {
+      Promise.resolve(context.resume()).catch(error => toast(error.message || '无法启动语音播放'));
+    }
+    const silence = context.createBuffer(1, 1, context.sampleRate || 22050);
+    const source = context.createBufferSource();
+    source.buffer = silence;
+    source.connect(context.destination);
+    source.start(0);
+    return true;
+  } catch (error) {
+    toast(error.message || '无法启动语音播放');
+    return false;
+  }
 }
 
 function stopAudio() {
@@ -437,6 +657,7 @@ function handleMessage(message) {
       if (state.currentTurn) {
         state.currentTurn._rawText = message.text;
         state.currentTurn._metadata = message.metadata || {};
+        updateEvidenceChip(state.currentTurn);
         state.currentTurn._body.classList.remove('generating');
         renderAnswerMarkdown(state.currentTurn._body, message.text);
         const elapsed = message.metadata?.voice?.text_completed_ms;
@@ -450,6 +671,7 @@ function handleMessage(message) {
         state.currentTurn._body.classList.remove('generating');
         renderAnswerMarkdown(state.currentTurn._body, state.currentTurn._rawText);
         state.currentTurn._metadata = message.metadata || {};
+        updateEvidenceChip(state.currentTurn);
         if (message.metadata?.cooperation) state.currentTurn._route.textContent = cooperationLabel(message.metadata.cooperation);
         const first = message.first_chunk_ms || message.metadata?.voice?.llm_first_text_ms;
         state.currentTurn._timing.textContent = message.metadata?.handoff?.status === 'pending'
@@ -540,6 +762,14 @@ async function toggleRecording() {
   }
   if (state.micStarting) return;
   if (state.ws?.readyState !== WebSocket.OPEN) { toast('请等待服务连接'); return; }
+  // Stop the old voice before requesting microphone permission. Cancelling an
+  // unfinished answer also prevents later TTS chunks from speaking over ASR.
+  if (state.generating || state.currentTurn || state.audioSources.size || state.pendingAudio) {
+    if (state.stopping) stopAudio();
+    else stopReply();
+  } else {
+    stopAudio();
+  }
   state.micStarting = true;
   const epoch = state.recordingEpoch;
   const ws = state.ws;
@@ -674,16 +904,17 @@ $('#messages').addEventListener('click', async event => {
   const turn = button.closest('.turn');
   const action = button.dataset.action;
   if (action === 'speak') {
-    await ensureAudio().catch(() => {});
     stopAudio();
-    if (send({type: 'speak', text: turn._rawText, speed: state.speed})) setGenerating(true, '正在合成语音');
+    if (primeAudioFromGesture() && send({type: 'speak', text: turn._rawText, speed: state.speed})) {
+      setGenerating(true, '正在合成语音');
+    }
   } else if (action === 'copy') {
     await navigator.clipboard.writeText(turn._rawText);
     toast('已复制');
   } else if (action === 'retry') {
     send({type: 'chat', text: turn._question, mode: turn._mode, autoplay: state.autoplay, speed: state.speed});
   } else if (action === 'sources') {
-    renderEvidence(turn._metadata);
+    renderEvidence(turn._metadata, turn._question, turn._rawText);
   }
 });
 

@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import Mock
 
 from context_manager import ContextManager
-from cooperative import CooperativeClient, plan_conversation
+from cooperative import CooperativeClient, _lookup_fee_rate, _previous_source_answer, plan_conversation
 from rag import RAGClient, RetrievalResult, RetrievedChunk
 
 
@@ -36,6 +36,198 @@ class Model:
 
 
 class CooperativeTests(unittest.TestCase):
+    def test_rate_table_lookup_uses_exact_age_band_and_payment_period(self):
+        self.assertEqual(_lookup_fee_rate(7, "有社保", "年缴"), (279, 5, 10))
+        self.assertEqual(_lookup_fee_rate(33, "无社保", "月缴"), (96, 31, 35))
+        self.assertEqual(_lookup_fee_rate(71, "有社保", "年缴"), (3928, 71, 75))
+
+    def test_rate_answer_is_deterministic_when_rate_table_is_retrieved(self):
+        class RateRetriever(Retriever):
+            def search(self, query):
+                self.queries.append(query)
+                item = RetrievedChunk(
+                    9, 1, 1, "## 年缴费率 | 5-10岁 | 有社保 279元", .8, .5,
+                    "尊享E生2026缴费率.pdf", "pdf", "费率表 第1页",
+                )
+                return RetrievalResult(query, True, .47, .08, 1, (item,))
+
+        model, retriever = Model(), RateRetriever()
+        client = CooperativeClient(RAGClient(model, retriever))
+        response = client.stream_chat(messages("7岁有社保，尊享E生2026年缴多少钱？"))
+        answer = "".join(response)
+        self.assertIn("279元/年", answer)
+        self.assertIn("5–10岁档", answer)
+        self.assertEqual(model.calls, [])
+        self.assertTrue(response.metadata["evidence_sources"])
+
+    def test_prior_quote_condition_recap_keeps_premium_and_correct_rate_evidence(self):
+        class MixedRetriever(Retriever):
+            def search(self, query):
+                self.queries.append(query)
+                hits = (
+                    RetrievedChunk(1, 1, 1,
+                        "年缴费率（单位：元/年）\n| 年龄 | 有社保 | 无社保 |\n| 31-35岁 | 423 | 971 |",
+                        .9, .8, "尊享E生百万医疗2026年缴费率.pdf", "pdf_transcription", "第1页费率表"),
+                    RetrievedChunk(2, 1, 1,
+                        "月缴费率（单位：元/月）\n| 31-35岁 | 42 | 96 |",
+                        .8, .7, "尊享E生百万医疗2026月缴费率.pdf", "pdf_transcription", "第1页费率表"),
+                    RetrievedChunk(3, 1, 1,
+                        "以有基本医保身份参保，但未按医保身份结算时赔付比例为60%",
+                        .7, .6, "投保须知.pdf", "pdf", "第1页赔付比例"),
+                )
+                return RetrievalResult(query, True, .47, .08, 1, hits)
+
+        model, retriever = Model(), MixedRetriever()
+        client = CooperativeClient(RAGClient(model, retriever))
+        response = client.stream_chat(messages(
+            "我30岁有基本医保，年缴保费是多少？",
+            "不是30岁，而是35岁，其他条件不变。",
+            "如果没有基本医保，保费是多少？",
+            "再改回有基本医保。你先告诉我现在记录的年龄、医保情况和缴费方式分别是什么。",
+        ), turn_history=[{"assistant_text": "年缴基础费率为971元/年。",
+                          "metadata": {"cooperation": {"intent": "quote"}}}])
+        answer = "".join(response)
+        self.assertIn("年龄35岁", answer)
+        self.assertIn("有基本医保", answer)
+        self.assertIn("年缴", answer)
+        self.assertIn("423元/年", answer)
+        self.assertEqual(model.calls, [])
+        self.assertIn("医疗保险保费报价", retriever.queries[0])
+        self.assertEqual(len(response.metadata["evidence_sources"]), 1)
+        evidence = response.metadata["evidence_sources"][0]
+        self.assertIn("年缴费率.pdf", evidence["source_name"])
+        self.assertIn("31-35岁 | 423 | 971", evidence["text"])
+        self.assertNotIn("赔付比例", evidence["text"])
+        self.assertEqual(response.metadata["cooperation"]["reason"], "quote_condition_recap")
+
+    def test_condition_recap_without_prior_quote_does_not_add_rate(self):
+        model, retriever = Model(), Retriever()
+        client = CooperativeClient(RAGClient(model, retriever))
+        response = client.stream_chat(messages(
+            "我35岁，有基本医保，按年缴费。",
+            "现在记录的年龄、医保情况和缴费方式分别是什么？",
+        ))
+        self.assertNotIn("423元", "".join(response))
+        self.assertNotIn("exact_rate_lookup", response.metadata["cooperation"]["stages"])
+
+    def test_prior_quote_recap_without_rate_evidence_hands_off(self):
+        model, retriever = Model(), Retriever(False)
+        client = CooperativeClient(RAGClient(model, retriever))
+        response = client.stream_chat(messages(
+            "我35岁有基本医保，年缴保费是多少？",
+            "现在记录的年龄、医保情况和缴费方式分别是什么？",
+        ), turn_history=[{"assistant_text": "年缴基础费率为423元/年。",
+                          "metadata": {"cooperation": {"intent": "quote"}}}])
+        self.assertEqual(response.metadata["decision"], "handoff")
+        self.assertEqual(response.metadata.get("evidence_sources", []), [])
+        self.assertIn("转人工", "".join(response))
+        self.assertEqual(model.calls, [])
+
+    def test_quote_recap_survives_intervening_service_and_handoff_turns(self):
+        class RateRetriever(Retriever):
+            def search(self, query):
+                self.queries.append(query)
+                item = RetrievedChunk(
+                    7, 1, 1, "年缴费率（单位：元/年）\n| 31-35岁 | 423 | 971 |",
+                    .8, .6, "尊享E生百万医疗2026年缴费率.pdf",
+                    "pdf_transcription", "第1页费率表",
+                )
+                return RetrievalResult(query, True, .47, .08, 1, (item,))
+
+        model, retriever = Model(), RateRetriever()
+        client = CooperativeClient(RAGClient(model, retriever))
+        history = [
+            {"assistant_text": "971元/年", "metadata": {"cooperation": {"intent": "quote"}}},
+            {"assistant_text": "我是 AI 保险业务助手", "metadata": {"cooperation": {"intent": "service"}}},
+            {"assistant_text": "需转人工", "metadata": {"decision": "handoff",
+                                          "cooperation": {"intent": "general"}}},
+        ]
+        response = client.stream_chat(messages(
+            "我35岁，没有基本医保，年缴多少钱？",
+            "你好，你是谁？",
+            "再改回有基本医保。你先告诉我现在记录的年龄、医保情况和缴费方式分别是什么。",
+        ), turn_history=history)
+        self.assertIn("423元/年", "".join(response))
+        self.assertEqual(response.metadata["cooperation"]["reason"], "quote_condition_recap")
+        self.assertEqual(len(response.metadata["evidence_sources"]), 1)
+        self.assertEqual(model.calls, [])
+
+    def test_fee_source_followup_uses_persisted_previous_answer_citation(self):
+        class RateRetriever(Retriever):
+            def search(self, query):
+                self.queries.append(query)
+                hits = tuple(RetrievedChunk(
+                    number, 1, 1, "费率表", .8, .5,
+                    f"尊享E生百万医疗2026{period}费率.pdf", "pdf_transcription", "第1页费率表",
+                ) for number, period in ((1, "年缴"), (2, "月缴")))
+                return RetrievalResult(query, True, .47, .08, 1, hits)
+
+        model, retriever = Model(), RateRetriever()
+        client = CooperativeClient(RAGClient(model, retriever))
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "history.sqlite3"
+            with ContextManager(client, db_path=path) as context:
+                session = context.create_session()
+                quote = context.chat(session, "我30岁有社保，年缴基础保费是多少？", thinking_mode="auto")
+                self.assertIn("318元/年", quote)
+                first = context.get_history(session)[0]
+                self.assertEqual(len(first["metadata"]["cited_sources"]), 1)
+                self.assertIn("年缴费率.pdf", first["metadata"]["cited_sources"][0])
+            with ContextManager(client, db_path=path) as context:
+                answer = context.chat(session, "你刚才给出的保费依据哪份资料？具体出处是什么？", thinking_mode="auto")
+                self.assertIn("年缴费率.pdf", answer)
+                self.assertNotIn("月缴费率.pdf", answer)
+                self.assertNotIn("待人工", answer)
+                self.assertEqual(context.get_history(session)[-1]["metadata"]["decision"], "answer")
+        self.assertEqual(model.calls, [])
+        self.assertEqual(len(retriever.queries), 1)
+
+    def test_source_followup_without_prior_citation_does_not_invent_one(self):
+        model, retriever = Model(), Retriever()
+        client = CooperativeClient(RAGClient(model, retriever))
+        response = client.stream_chat(messages("你刚才的报价依据是什么？"), turn_history=[{
+            "assistant_text": "基础费率为318元/年。", "metadata": {"decision": "answer"},
+        }])
+        self.assertEqual(response.metadata["decision"], "handoff")
+        self.assertEqual(response.metadata["cited_sources"], [])
+        self.assertIn("不能推测", "".join(response))
+        self.assertEqual(model.calls, [])
+        self.assertEqual(retriever.queries, [])
+
+    def test_old_premium_answer_cannot_cite_unrelated_policy_clause(self):
+        history = [{"assistant_text": "对应保费为423元/年。", "metadata": {
+            "decision": "answer",
+            "cited_sources": ["来源：投保须知.pdf，第1页医保赔付比例"],
+            "evidence_sources": [{"source_name": "投保须知.pdf", "text": "医保赔付比例为60%"}],
+        }}]
+        self.assertIsNone(_previous_source_answer(history))
+
+    def test_previous_source_collapses_two_locations_on_same_pdf_page(self):
+        history = [{"assistant_text": "年缴基础费率为318元/年。", "metadata": {
+            "decision": "answer", "cited_sources": [
+                "来源：尊享E生百万医疗2026年缴费率.pdf，第1页费率表（人工核对转录）",
+                "来源：尊享E生百万医疗2026年缴费率.pdf，第1页",
+                "来源：尊享E生百万医疗2026月缴费率.pdf，第1页",
+            ],
+        }}]
+        answer, metadata = _previous_source_answer(history)
+        self.assertEqual(answer.count("年缴费率.pdf"), 1)
+        self.assertNotIn("月缴费率.pdf", answer)
+        self.assertEqual(len(metadata["cited_sources"]), 1)
+
+    def test_retry_after_old_source_handoff_uses_original_quote(self):
+        history = [
+            {"user_text": "我30岁有社保，年缴多少钱？", "assistant_text": "基础费率为318元/年。",
+             "metadata": {"decision": "answer", "cited_sources": [
+                 "来源：尊享E生百万医疗2026年缴费率.pdf，第1页",
+             ]}},
+            {"user_text": "刚才的保费依据是什么？", "assistant_text": "需转人工处理。",
+             "metadata": {"decision": "handoff"}},
+        ]
+        result = _previous_source_answer(history)
+        self.assertIsNotNone(result)
+        self.assertIn("年缴费率.pdf", result[0])
+
     def test_ambiguous_health_question_asks_one_question_without_model_or_retrieval(self):
         model, retriever = Model(), Retriever()
         client = CooperativeClient(RAGClient(model, retriever))
@@ -75,6 +267,27 @@ class CooperativeTests(unittest.TestCase):
         self.assertEqual(plan.resolved_mode, "fast")
         self.assertIn("30岁", plan.query)
         self.assertIn("有社保", plan.query)
+
+    def test_heldout_paraphrases_do_not_prompt_for_known_conditions(self):
+        quote = plan_conversation(messages("我今年35岁，没有基本医保，月付这份保险要多少钱？"))
+        self.assertEqual(quote.intent, "quote")
+        self.assertIsNone(quote.pending_slot)
+        self.assertEqual(quote.slots["social_insurance"]["value"], "无社保")
+        self.assertEqual(quote.slots["payment"]["value"], "月缴")
+        for question in (
+            "如果我在加拿大医院接受质子治疗，能直接按先进疗法责任申请赔付吗？",
+            "特药处方一次开40天，超出30天的那10天药量一定能报吗？",
+            "牙齿因意外受伤要治疗，能直接说所有牙科治疗都免责吗？",
+        ):
+            with self.subTest(question=question):
+                plan = plan_conversation(messages(question))
+                self.assertEqual(plan.intent, "general")
+                self.assertIsNone(plan.pending_slot)
+
+    def test_explicit_underwriting_guarantee_hands_off_without_age_prompt(self):
+        plan = plan_conversation(messages("我有高血压但其他信息未提供，能不能保证这次投保必然通过？"))
+        self.assertEqual(plan.decision, "handoff")
+        self.assertEqual(plan.reason, "individual_underwriting_unavailable")
 
     def test_person_change_does_not_transfer_age_social_insurance_or_health(self):
         plan = plan_conversation(messages("我30岁有社保有高血压，年缴多少钱", "不是我，是我父亲，65岁"))
@@ -156,9 +369,32 @@ class CooperativeTests(unittest.TestCase):
     def test_general_followup_and_comparison_are_not_lost(self):
         plan = plan_conversation(messages("等待期是什么", "它怎么算"))
         self.assertIn("等待期是什么", plan.query)
+        contextual = plan_conversation(messages(
+            "我35岁有基本医保，尊享E生一般医疗责任的免赔额是多少？",
+            "根据前文，我现在的条件下这个免赔额怎么算？",
+        ))
+        self.assertIn("一般医疗责任", contextual.query)
+        self.assertIn("35岁", contextual.query)
+        self.assertIn("有社保", contextual.query)
         plan = plan_conversation(messages("30岁和65岁年缴保费各多少钱"))
         self.assertIsNone(plan.pending_slot)
         self.assertEqual(plan.resolved_mode, "slow")
+
+    def test_retrieval_query_expands_hospital_scope_and_bnct_terms(self):
+        hospital = plan_conversation(messages("一般医疗赔付需要满足怎样的医院等级和科室范围？"))
+        self.assertIn("二级及二级以上公立医院", hospital.query)
+        bnct = plan_conversation(messages("BNCT责任的指定医院有哪些？"))
+        self.assertIn("硼中子俘获治疗", bnct.query)
+
+    def test_specific_hospital_membership_question_hands_off_without_guessing(self):
+        model, retriever = Model(), Retriever()
+        response = CooperativeClient(RAGClient(model, retriever)).stream_chat(
+            messages("资料没有列出某个具体医院是否属于指定民营医疗机构，能否确认？")
+        )
+        self.assertEqual(response.metadata["handoff"]["reason"], "specific_hospital_list_unavailable")
+        self.assertIn("转人工", "".join(response))
+        self.assertEqual(model.calls, [])
+        self.assertEqual(retriever.queries, [])
 
     def test_preview_does_not_commit_or_ask_clarification(self):
         retriever = Retriever()

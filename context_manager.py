@@ -258,6 +258,13 @@ class ResponseStream(Iterator[str]):
                         break
                     if chunk:
                         self._queue.put(chunk)
+            # Source attribution is computed after the final generated token.
+            # Persist its updated metadata before the consumer sees completion.
+            final_metadata = getattr(source_iterator, "metadata", None)
+            if isinstance(final_metadata, dict):
+                with self._lock:
+                    self._metadata.update(final_metadata)
+                    self._store.merge_metadata(self.turn_id, final_metadata)
         except BaseException as exc:
             with self._lock:
                 if self._status == "generating":
@@ -449,6 +456,11 @@ class ContextManager:
                 self._ensure_open()
                 messages = self._messages(session_id)
                 messages.append({"role": "user", "content": prompt})
+                if getattr(self.client, "supports_turn_history", False):
+                    # Business wrappers may need the provenance of the preceding
+                    # answer. Keep it out of model chat messages and generation
+                    # options for clients that do not explicitly support it.
+                    generation_options["turn_history"] = self._store.turns(session_id)
                 turn_id = self._store.begin_turn(session_id, prompt)
                 response = ResponseStream(
                     self.client, self._store, turn_id, messages, generation_options, started,

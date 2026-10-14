@@ -98,12 +98,15 @@ class CosyVoiceHandler(BaseHTTPRequestHandler):
             speaker = payload.get("speaker", "中文女")
             speed = float(payload.get("speed", 1.0))
             seed = int(payload.get("seed", 1986))
+            stream = payload.get("stream", True)
             if not isinstance(text, str) or not text.strip():
                 raise ValueError("text must not be empty")
             if speaker not in self.server.speakers:
                 raise ValueError(f"unknown speaker: {speaker}")
             if not 0.5 <= speed <= 2.0:
                 raise ValueError("speed must be between 0.5 and 2.0")
+            if not isinstance(stream, bool):
+                raise ValueError("stream must be a boolean")
         except (ValueError, TypeError, json.JSONDecodeError) as exc:
             self._json(400, {"error": str(exc)})
             return
@@ -121,7 +124,7 @@ class CosyVoiceHandler(BaseHTTPRequestHandler):
                 # character across separate streaming requests.
                 set_all_random_seed(seed)
                 for index, item in enumerate(self.server.model.inference_sft(
-                    text.strip(), speaker, stream=True, speed=speed,
+                    text.strip(), speaker, stream=stream, speed=speed,
                 )):
                     now = perf_counter()
                     samples = item["tts_speech"].detach().cpu().numpy().reshape(-1)

@@ -7,6 +7,7 @@ from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 from queue import Empty, Queue
+import re
 from threading import Event, Lock, RLock, Thread, current_thread
 from time import perf_counter
 from typing import Any
@@ -74,8 +75,10 @@ class VoiceResponse(Iterator[AudioChunk]):
         self._first_audio_ms: float | None = None
         self._text_completed_ms: float | None = None
         self._audio_duration_ms = 0.0
+        self._sample_rate: int | None = None
         self._synthesis_ms = 0.0
         self._segment_count = 0
+        self._nonstream_segment_count = 0
         self._audio_chunk_count = 0
         self._released = False
         self._staged: list[AudioChunk] = []
@@ -128,6 +131,7 @@ class VoiceResponse(Iterator[AudioChunk]):
             "tts_synthesis_ms": self._synthesis_ms,
             "output_audio_ms": self._audio_duration_ms,
             "tts_segment_count": self._segment_count,
+            "tts_nonstream_segment_count": self._nonstream_segment_count,
             "tts_audio_chunk_count": self._audio_chunk_count,
             "recommended_prebuffer_ms": self.prebuffer_ms,
             "minimum_buffer_margin_ms": self._minimum_buffer_margin_ms,
@@ -169,8 +173,41 @@ class VoiceResponse(Iterator[AudioChunk]):
         if self._stop.is_set():
             return
         with self._lock:
+            is_following_segment = self._segment_count > 0
             self._segment_count += 1
-        synthesis_options: dict[str, Any] = {"speed": self.speed}
+            sample_rate = self._sample_rate
+        if is_following_segment and sample_rate:
+            # Sentence segmentation strips terminal punctuation before TTS.
+            # Add a short PCM gap between separately synthesized clauses so
+            # concatenated playback still has a perceptible, stable pause.
+            pause_ms = 180.0
+            silence = AudioChunk(
+                index=self._audio_chunk_count,
+                text="",
+                pcm16=bytes(round(sample_rate * pause_ms / 1000) * 2),
+                sample_rate=sample_rate,
+                duration_ms=pause_ms,
+                synthesis_ms=0.0,
+                rtf=0.0,
+            )
+            with self._lock:
+                self._audio_duration_ms += pause_ms
+            self._publish(silence)
+        with self._lock:
+            buffered_ms = max(0.0, (self._playback_until - perf_counter()) * 1000) if self._playback_until else 0.0
+        # Full-utterance synthesis avoids audible articulation glitches in
+        # some long technical clauses. Only select it once already-buffered
+        # audio can cover a conservative estimate of the synthesis time.
+        estimated_synthesis_ms = max(2500.0, len(text) * 100.0)
+        stream = not (
+            is_following_segment
+            and self.speed == 1.0
+            and buffered_ms >= estimated_synthesis_ms + 1000.0
+        )
+        if not stream:
+            with self._lock:
+                self._nonstream_segment_count += 1
+        synthesis_options: dict[str, Any] = {"speed": self.speed, "stream": stream}
         for chunk in self.tts.synthesize_stream(
             text, index=self._audio_chunk_count, cancel_event=self._stop, sanitize=True,
             **synthesis_options,
@@ -179,11 +216,19 @@ class VoiceResponse(Iterator[AudioChunk]):
                 self._audio_chunk_count += 1
                 self._audio_duration_ms += chunk.duration_ms
                 self._synthesis_ms += chunk.synthesis_ms
+                self._sample_rate = chunk.sample_rate
             self._publish(chunk)
 
     def _produce_text(self) -> None:
         pending_speech_segments: list[str] = []
         first_speech_segment = True
+
+        def join_sentences(segments: list[str]) -> str:
+            joined = segments[0]
+            for segment in segments[1:]:
+                separator = "" if re.search(r"[。！？!?；;]$", joined) else "。"
+                joined += separator + segment
+            return joined
 
         def queue_speech_segment(segment: str) -> None:
             nonlocal first_speech_segment
@@ -195,7 +240,7 @@ class VoiceResponse(Iterator[AudioChunk]):
                 return
             pending_speech_segments.append(segment)
             if len(pending_speech_segments) >= 2:
-                self._segments.put("。".join(pending_speech_segments))
+                self._segments.put(join_sentences(pending_speech_segments))
                 pending_speech_segments.clear()
 
         try:
@@ -214,7 +259,7 @@ class VoiceResponse(Iterator[AudioChunk]):
                 for segment in self._segmenter.flush():
                     queue_speech_segment(segment)
                 if pending_speech_segments:
-                    self._segments.put("。".join(pending_speech_segments))
+                    self._segments.put(join_sentences(pending_speech_segments))
                     pending_speech_segments.clear()
                 self._text_completed_ms = (perf_counter() - self._request_started) * 1000
         except BaseException as exc:

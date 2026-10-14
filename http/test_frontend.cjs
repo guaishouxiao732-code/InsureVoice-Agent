@@ -4,10 +4,12 @@ const vm = require('vm');
 const assert = require('assert/strict');
 const path = require('path');
 
-const element = () => ({hidden:false, attributes:{},classList: {toggle(name,value){if(name==='hidden')this.hidden=value;},remove(){},add(){}},
+const element = () => ({hidden:false, attributes:{},listeners:{},classList: {toggle(name,value){if(name==='hidden')this.hidden=value;},remove(){},add(){}},
   children: [],append(...children) {this.children.push(...children);},
+  insertBefore(child,before) {const index=this.children.indexOf(before);this.children.splice(index < 0 ? this.children.length : index,0,child);},
   replaceChildren(...children) {this.children = children;},
-  addEventListener(){},setAttribute(name,value){this.attributes[name]=value;},textContent:'',value:'',style:{}});
+  addEventListener(name,callback){this.listeners[name]=callback;},scrollIntoView(){},
+  setAttribute(name,value){this.attributes[name]=value;},textContent:'',value:'',style:{}});
 const nodes = new Map();
 const context = vm.createContext({
   document: {querySelector: s => {if (!nodes.has(s)) nodes.set(s, element());return nodes.get(s);},
@@ -80,8 +82,22 @@ vm.runInContext(app.replace(/initialize\(\);\s*$/, ''), context);
   vm.runInContext('stopAudio()',context);
   vm.runInContext(`renderEvidence({knowledge_mode:'rag',sources:[{source_name:'未选中资料'}],
     evidence_sources:[{source_name:'已选中资料',location:'第1页',text:'实际注入模型的片段'}]})`,context);
-  assert.equal(nodes.get('#evidence-content').children.length,2);
-  assert.match(nodes.get('#evidence-content').children[1].children[0].children[0].textContent,/已选中资料/);
+  assert.equal(nodes.get('#evidence-content').children.length,3);
+  assert.match(nodes.get('#evidence-content').children[2].children[0].children[0].textContent,/已选中资料/);
+  vm.runInContext(`renderEvidence({knowledge_mode:'rag',evidence_sources:[{
+    source_name:'费率表',text:'年缴费率为318元。<script>不执行</script>'}]},'年缴费率是多少？')`,context);
+  const evidence = nodes.get('#evidence-content');
+  const search = evidence.children[1];
+  const snippet = evidence.children[2].children[1];
+  assert.ok(snippet.children.some(child => child.className === 'evidence-highlight'));
+  assert.match(snippet.children.map(child => child.textContent).join(''),/<script>不执行<\/script>/);
+  search.children[0].value = '318';
+  search.children[0].listeners.input();
+  assert.deepEqual(snippet.children.filter(child => child.className === 'evidence-highlight').map(child => child.textContent),['318']);
+  assert.match(search.children[2].textContent,/找到 1 处/);
+  search.children[0].value = '不存在';
+  search.children[0].listeners.input();
+  assert.match(search.children[2].textContent,/未找到/);
   console.log('PASS: stop remains visible during playback; immediate local cancellation rejects stale audio; evidence uses actual selected sources');
   for (const savedMode of ['continuous', 'recording', null]) {
     const preferenceContext = vm.createContext({...context,
@@ -134,7 +150,26 @@ vm.runInContext(app.replace(/initialize\(\);\s*$/, ''), context);
   await context.recorders[1].stopped;
   assert.equal(context.sent.length, 1, 'cancelled recording must not submit');
   assert.equal(stoppedTracks.length, 2);
+  context.micStopCalls = 0;
+  vm.runInContext(`state.stopping=false;state.generating=true;state.responseId=6;
+    state.audioSources.add({stop(){micStopCalls++}});state.pendingAudio=1;`, context);
+  const recordingOverSpeech = vm.runInContext('toggleMicrophone()', context);
+  assert.equal(context.micStopCalls, 1, 'microphone click must stop speech synchronously');
+  assert.equal(context.sent.at(-1).type, 'interrupt', 'unfinished speech must not resume during recording');
+  assert.equal(vm.runInContext('state.pendingAudio', context), 0);
+  await recordingOverSpeech;
+  assert.equal(context.recorders[2].state, 'recording');
+  vm.runInContext(`handleMessage({type:'response_epoch',response_id:7});
+    handleMessage({type:'interrupted'});
+    handleMessage({type:'audio_chunk',response_id:6,pcm:'AAA=',sample_rate:16000});`, context);
+  assert.equal(context.recorders[2].state, 'recording', 'interrupt acknowledgement must not cancel the new recording');
+  assert.equal(vm.runInContext('state.audioSources.size', context), 0);
+  await vm.runInContext('toggleMicrophone()', context);
+  await context.recorders[2].stopped;
+  assert.equal(context.sent.at(-1).type, 'voice');
+  assert.equal(context.sent.filter(message => message.type === 'voice').length, 2);
   console.log('PASS: only click-to-record; old continuous preferences ignored; second click submits once; cancellation releases microphone without upload');
+  console.log('PASS: starting a recording synchronously stops playback and cancels the old response without cancelling the new recording');
   console.log('PASS: asynchronous playback cancellation; stale response rejection');
   console.log('PASS: pending handoff in live answer, restored history and evidence panel');
   console.log('PASS: default auto mode, cooperative route updates and user condition display');
